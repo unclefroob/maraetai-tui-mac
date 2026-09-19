@@ -141,7 +141,16 @@ fn dispatch(request: Request, playback: &PlaybackHandle, shutdown: &Arc<Notify>)
             playback.toggle_shuffle();
             Response::Unit
         }
-        Request::Status => Response::Status(status_tuple_from_snapshot(&playback.snapshot())),
+        // Every connected TUI polls this every ~250ms for as long as it's
+        // open, so it doubles as the daemon's "someone is using this"
+        // signal for the idle timer (see `mark_client_activity`) —
+        // otherwise an open TUI sitting on a paused/stopped track looks
+        // identical to no client at all, and gets shut down out from
+        // under it.
+        Request::Status => {
+            playback.mark_client_activity();
+            Response::Status(status_tuple_from_snapshot(&playback.snapshot()))
+        }
         Request::Quit => {
             shutdown.notify_one();
             Response::Unit
