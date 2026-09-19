@@ -139,6 +139,7 @@ mod tests {
             Request::PlayAt { index: 3 },
             Request::SeekTo { position_secs: 12.5 },
             Request::MoveInQueue { from: 1, to: 4 },
+            Request::PlayNext { tracks: vec![] },
         ] {
             let json = serde_json::to_string(&request).unwrap();
             let _: Request = serde_json::from_str(&json).unwrap();
