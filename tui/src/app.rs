@@ -38,7 +38,10 @@ use ratatui_image::{Resize, StatefulImage};
 use tokio::sync::mpsc;
 
 use crate::art;
+#[cfg(target_os = "linux")]
 use crate::dbus_client::{ControlProxy, QueueEntry};
+#[cfg(target_os = "macos")]
+use crate::socket_client::{ControlProxy, QueueEntry};
 use crate::library::{self, Album, Artist, Genre, Playlist, Song};
 
 const POLL_INTERVAL: Duration = Duration::from_millis(250);

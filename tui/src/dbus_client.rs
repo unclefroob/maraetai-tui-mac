@@ -5,13 +5,10 @@
 //! ever drifting from `maraetai_common::dbus`, which stays the source of
 //! truth for what the *daemon* actually registers.
 
+pub use maraetai_common::control_protocol::QueueEntry;
+use maraetai_common::control_protocol::{QueueRow, StatusTuple};
 use zbus::Connection;
 use zbus::proxy;
-
-/// One queue entry: (stream_url, title, artist, album, art_url,
-/// duration_secs, format_label, lossless, song_id) — must match
-/// `daemon::control::QueueEntry` exactly.
-pub type QueueEntry = (String, String, String, String, String, f64, String, bool, String);
 
 #[proxy(
     interface = "com.maraetai.Daemon1",
@@ -31,11 +28,9 @@ pub trait Control {
     async fn move_in_queue(&self, from: u32, to: u32) -> zbus::Result<()>;
     /// Empties the queue and stops playback.
     async fn clear_queue(&self) -> zbus::Result<()>;
-    /// (title, artist, album, duration_secs, format_label, lossless,
-    /// song_id) per track, in order — `song_id` lets the TUI build a
+    /// One row per track, in order — `song_id` lets the TUI build a
     /// playlist straight from the current queue.
-    #[allow(clippy::type_complexity)]
-    async fn queue(&self) -> zbus::Result<Vec<(String, String, String, f64, String, bool, String)>>;
+    async fn queue(&self) -> zbus::Result<Vec<QueueRow>>;
     async fn spectrum(&self) -> zbus::Result<Vec<u8>>;
     async fn next(&self) -> zbus::Result<()>;
     async fn previous(&self) -> zbus::Result<()>;
@@ -47,10 +42,7 @@ pub trait Control {
     /// Cycles Off -> Track -> Queue -> Off.
     async fn cycle_repeat(&self) -> zbus::Result<()>;
     async fn toggle_shuffle(&self) -> zbus::Result<()>;
-    #[allow(clippy::type_complexity)]
-    async fn status(
-        &self,
-    ) -> zbus::Result<(String, String, String, String, f64, f64, u32, u32, f64, String, bool, String, String, String, bool)>;
+    async fn status(&self) -> zbus::Result<StatusTuple>;
     async fn quit(&self) -> zbus::Result<()>;
 }
 

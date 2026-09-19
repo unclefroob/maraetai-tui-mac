@@ -25,6 +25,15 @@ pub fn pidfile_path() -> PathBuf {
     runtime_dir().join("daemon.pid")
 }
 
+/// Path to the daemon's control-channel Unix socket — macOS's transport
+/// (no D-Bus session bus is available there by default; see the daemon's
+/// `socket_control` and the TUI's `socket_client`). Unused on Linux, which
+/// talks to the daemon over D-Bus instead, but defined unconditionally
+/// since it's plain data with no platform-specific meaning of its own.
+pub fn control_socket_path() -> PathBuf {
+    runtime_dir().join("control.sock")
+}
+
 #[cfg(unix)]
 fn uid() -> u32 {
     // SAFETY: getuid() has no preconditions and cannot fail.

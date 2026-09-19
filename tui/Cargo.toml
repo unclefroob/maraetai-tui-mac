@@ -12,7 +12,6 @@ path = "src/main.rs"
 maraetai-common.workspace = true
 tokio.workspace = true
 reqwest.workspace = true
-zbus.workspace = true
 clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -26,3 +25,8 @@ rpassword = "7"
 urlencoding = "2"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 ratatui-image = { version = "=2.0.1", default-features = false, features = ["crossterm", "rustix"] }
+
+# The daemon's control channel is D-Bus on Linux, a Unix socket on macOS —
+# see `daemon/src/main.rs`'s module doc. zbus is only needed for the former.
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus.workspace = true

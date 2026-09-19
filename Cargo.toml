@@ -17,13 +17,10 @@ zbus = { version = "4", default-features = false, features = ["tokio"] }
 clap = { version = "4", features = ["derive"] }
 directories = "5"
 md-5 = "0.10"
-# keyring has NO default backend feature — without one it silently falls
-# back to an in-memory mock store that reports success but persists nothing
-# (found by testing an actual save/load round-trip; see common/src/config.rs
-# tests and the E2E verification notes). sync-secret-service is the real
-# Linux Secret Service (GNOME Keyring/KWallet) backend, matching Entry's
-# synchronous API used throughout this project.
-keyring = { version = "3", features = ["sync-secret-service", "crypto-rust"] }
+# keyring's actual backend feature is picked per-target in common/Cargo.toml
+# (Linux needs a different one than macOS) — see the comment there. No
+# `keyring` entry here: a shared workspace dependency can't vary its
+# feature set by target.
 thiserror = "1"
 anyhow = "1"
 tracing = "0.1"

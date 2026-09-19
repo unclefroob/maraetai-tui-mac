@@ -1,9 +1,15 @@
 mod app;
 mod art;
+#[cfg(target_os = "linux")]
 mod dbus_client;
 mod library;
 mod lifecycle;
 mod login;
+// Compiled (and unit-tested) on every platform — it's plain Unix-socket
+// code, nothing macOS-specific about it — but only actually used under
+// `target_os = "macos"` (see `lifecycle.rs`).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+mod socket_client;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -68,14 +74,15 @@ async fn main() -> Result<()> {
 }
 
 async fn run_daemon_action(action: DaemonAction) -> Result<()> {
-    let connection = zbus::Connection::session()
-        .await
-        .context("connecting to the D-Bus session bus")?;
-    let proxy = dbus_client::connect(&connection).await;
+    let session = lifecycle::connect_existing().await;
+    let proxy = match &session {
+        Ok(session) => lifecycle::connect(session).await.ok(),
+        Err(_) => None,
+    };
 
     match action {
         DaemonAction::Status => match proxy {
-            Ok(proxy) => match proxy.status().await {
+            Some(proxy) => match proxy.status().await {
                 Ok((
                     status,
                     title,
@@ -116,14 +123,14 @@ async fn run_daemon_action(action: DaemonAction) -> Result<()> {
                 }
                 Err(_) => println!("daemon not running"),
             },
-            Err(_) => println!("daemon not running"),
+            None => println!("daemon not running"),
         },
         DaemonAction::Stop => match proxy {
-            Ok(proxy) if proxy.status().await.is_ok() => {
+            Some(proxy) => {
                 proxy.quit().await.context("sending Quit to the daemon")?;
                 println!("stop requested");
             }
-            _ => println!("daemon not running — nothing to stop"),
+            None => println!("daemon not running — nothing to stop"),
         },
     }
     Ok(())
@@ -138,10 +145,8 @@ async fn run_play(
     let creds = Credentials::load().context("run `maraetai login` first")?;
     let stream_url = library::Client::new(creds).stream_url(&song_id);
 
-    let connection = lifecycle::ensure_daemon_running().await?;
-    let proxy = dbus_client::connect(&connection)
-        .await
-        .context("connecting to daemon control interface")?;
+    let session = lifecycle::ensure_daemon_running().await?;
+    let proxy = lifecycle::connect(&session).await?;
     let track = (
         stream_url,
         title.unwrap_or_default(),
@@ -163,9 +168,7 @@ async fn run_play(
 
 async fn run_tui() -> Result<()> {
     let creds = Credentials::load().context("run `maraetai login` first")?;
-    let connection = lifecycle::ensure_daemon_running().await?;
-    let proxy = dbus_client::connect(&connection)
-        .await
-        .context("connecting to daemon control interface")?;
+    let session = lifecycle::ensure_daemon_running().await?;
+    let proxy = lifecycle::connect(&session).await?;
     app::run(proxy, creds).await
 }

@@ -21,6 +21,7 @@ use std::time::Duration;
 
 use maraetai_common::Credentials;
 use maraetai_common::auth::AuthParams;
+use maraetai_common::control_protocol::{QueueEntry, QueueRow, StatusTuple};
 use rand::seq::SliceRandom;
 use rodio::{Decoder, OutputStream, OutputStreamBuilder, Sink, Source};
 use tokio::sync::mpsc::UnboundedSender;
@@ -157,6 +158,79 @@ impl Default for Snapshot {
             shuffle: false,
         }
     }
+}
+
+/// Converts one wire-format queue entry into the engine's own `TrackMeta` —
+/// shared by both control-channel transports (D-Bus's `PlayQueue`/
+/// `AppendQueue` and the socket transport's equivalents) so they can't
+/// disagree on the mapping.
+pub fn track_meta_from_entry(entry: QueueEntry) -> TrackMeta {
+    let (stream_url, title, artist, album, art_url, duration_secs, format_label, lossless, song_id) = entry;
+    TrackMeta {
+        stream_url,
+        song_id,
+        title,
+        artist,
+        album,
+        art_url: (!art_url.is_empty()).then_some(art_url),
+        duration: (duration_secs > 0.0).then(|| Duration::from_secs_f64(duration_secs)),
+        format_label,
+        lossless,
+    }
+}
+
+/// The reverse of [`track_meta_from_entry`], for one queue row's *display*
+/// shape — shared by both transports' `queue()`/`Queue` handlers.
+pub fn queue_row_from_track(t: &TrackMeta) -> QueueRow {
+    (
+        t.title.clone(),
+        t.artist.clone(),
+        t.album.clone(),
+        t.duration.map(|d| d.as_secs_f64()).unwrap_or(0.0),
+        t.format_label.clone(),
+        t.lossless,
+        t.song_id.clone(),
+    )
+}
+
+/// A point-in-time `Snapshot` flattened into the wire's `status()` shape —
+/// shared by both transports' `status()`/`Status` handlers.
+pub fn status_tuple_from_snapshot(snap: &Snapshot) -> StatusTuple {
+    let status = match snap.status {
+        Status::Playing => "playing",
+        Status::Paused => "paused",
+        Status::Stopped => "stopped",
+    };
+    let (title, artist, album, duration, format_label, lossless, art_url, song_id) = match &snap.track {
+        Some(t) => (
+            t.title.clone(),
+            t.artist.clone(),
+            t.album.clone(),
+            t.duration.map(|d| d.as_secs_f64()).unwrap_or(0.0),
+            t.format_label.clone(),
+            t.lossless,
+            t.art_url.clone().unwrap_or_default(),
+            t.song_id.clone(),
+        ),
+        None => (String::new(), String::new(), String::new(), 0.0, String::new(), false, String::new(), String::new()),
+    };
+    (
+        status.to_string(),
+        title,
+        artist,
+        album,
+        snap.position.as_secs_f64(),
+        duration,
+        snap.queue_index as u32,
+        snap.queue_len as u32,
+        snap.volume as f64,
+        format_label,
+        lossless,
+        art_url,
+        song_id,
+        snap.repeat.as_str().to_string(),
+        snap.shuffle,
+    )
 }
 
 pub enum Command {
