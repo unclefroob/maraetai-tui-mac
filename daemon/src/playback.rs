@@ -173,7 +173,7 @@ impl Default for Snapshot {
 /// `AppendQueue` and the socket transport's equivalents) so they can't
 /// disagree on the mapping.
 pub fn track_meta_from_entry(entry: QueueEntry) -> TrackMeta {
-    let (stream_url, title, artist, album, art_url, duration_secs, format_label, lossless, song_id) = entry;
+    let (stream_url, title, artist, album, art_url, duration_secs, format_label, lossless, song_id, replay_gain_db) = entry;
     TrackMeta {
         stream_url,
         song_id,
@@ -184,6 +184,7 @@ pub fn track_meta_from_entry(entry: QueueEntry) -> TrackMeta {
         duration: (duration_secs > 0.0).then(|| Duration::from_secs_f64(duration_secs)),
         format_label,
         lossless,
+        replay_gain_db,
     }
 }
 
