@@ -1,45 +1,60 @@
-# maraetai-tui
+# maraetai-tui (macOS)
 
-A Linux terminal client for a Navidrome library via [`maraetai-service`](https://github.com/unclefroob/maraetai-service),
-with real OS media integration — media keys and desktop notification widgets
-via MPRIS — that survives closing the terminal.
+A macOS port of [maraetai-tui](https://github.com/unclefroob/maraetai-tui) — a
+terminal client for a Navidrome library via
+[`maraetai-service`](https://github.com/unclefroob/maraetai-service). Same
+feature set as the Linux original, sharing its full history; the one thing
+that's genuinely different is how the daemon and TUI talk to each other,
+since macOS has no D-Bus.
 
 ## Why two binaries
 
-MPRIS/media-key control needs a process that outlives the terminal window a
-TUI runs in, so this is split like `mpd`/`ncmpcpp`:
+Playback needs to survive the TUI's terminal closing, so this is split like
+`mpd`/`ncmpcpp`:
 
-- **`maraetaid`** — the daemon. Owns the audio output device, decode
-  pipeline, and the **queue**, and exposes two D-Bus interfaces on the
-  session bus: the standard `org.mpris.MediaPlayer2`/`.Player` (so
-  GNOME/KDE/`playerctl`/media keys already know how to talk to it — including
-  real `Next`/`Previous`) and a small custom `com.maraetai.Daemon1` for
-  everything MPRIS doesn't cover (loading a whole queue, explicit shutdown).
-  The queue lives here, not in the TUI, specifically so hardware media-key
-  Next/Previous — which never go anywhere near the TUI — actually work.
-- **`maraetai`** — the TUI. A thin client: talks to `maraetaid` over D-Bus
-  for playback/queue control, and talks directly to `maraetai-service`'s
-  existing Subsonic API for browsing/search, the same way every other
-  maraetai client already does. It also carries the CLI (`login`,
-  `daemon status`/`stop`, `play <song-id>`).
+- **`maraetaid`** — the daemon. Owns the audio output device, the decode
+  pipeline, and the **queue**.
+- **`maraetai`** — the TUI. A thin client: talks to `maraetaid` for
+  playback/queue control, and talks directly to `maraetai-service`'s
+  Subsonic API for browsing/search/playlists, the same way every other
+  maraetai client does. Also carries the CLI (`login`, `daemon status`/
+  `stop`, `play <song-id>`).
+
+## macOS vs. the Linux original
+
+- **Control channel.** Linux talks to the daemon over D-Bus, which also
+  gets it MPRIS media-key/lock-screen integration for free. macOS has no
+  D-Bus session bus by default, so this fork replaces that whole channel
+  with a small newline-delimited-JSON protocol over a Unix domain socket
+  (`$TMPDIR/maraetai-<uid>/control.sock`) — no setup step, nothing to
+  install or configure. The wire-shape conversions live in one shared
+  place (`daemon/src/playback.rs`) so the two transports can't drift in
+  behavior, only in format.
+- **No MPRIS-equivalent media-key/lock-screen integration.** MPRIS is a
+  D-Bus interface; nothing on macOS speaks it, so that half of the Linux
+  build's OS integration doesn't carry over here. A native
+  `MPNowPlayingInfoCenter` integration would be a separate, unbuilt
+  feature — everything else (browsing, playback, queue, playlists) is
+  identical.
+- **Credential storage.** Passwords go into the macOS Keychain (`keyring`
+  crate's `apple-native` backend) instead of Secret Service/KWallet.
 
 ## Not perpetually running by design
 
-The whole point of splitting into a daemon is media-key integration that
-survives the terminal closing — which means it's also very easy to forget
-about and leave using resources. So:
-
-- `maraetai` auto-spawns `maraetaid` on first use if it isn't already running
-  (checked via a real D-Bus RPC, not just process/pidfile presence).
+- `maraetai` auto-spawns `maraetaid` on first use if it isn't already
+  running (checked via a real round-trip call, not just process/socket
+  presence).
 - The daemon shuts itself down automatically after being idle — nothing
-  playing **and** no client activity — for a configurable timeout (default
-  20 minutes; set `idle_timeout_secs` in `config.toml` to change it). It will
-  never idle-shutdown while a track is actually playing, even with the
-  terminal closed.
+  playing **and** no client connected — for a configurable timeout
+  (default 20 minutes; set `idle_timeout_secs` in `config.toml` to
+  change it). An open TUI counts as "connected" even while paused/
+  stopped, so it won't get shut out from under you just for sitting idle
+  on-screen — only a TUI that's actually been closed (or a daemon nobody
+  ever opened one for) triggers the timeout.
 - `maraetai daemon stop` (or pressing `Q` in the TUI) asks it to quit
   immediately.
-- A `flock`ed pidfile at `$XDG_RUNTIME_DIR/maraetai/daemon.pid` prevents two
-  daemons from starting at once.
+- A locked pidfile under `$TMPDIR/maraetai-<uid>/` (macOS has no
+  `$XDG_RUNTIME_DIR`) prevents two daemons starting at once.
 
 ## Streaming, not buffer-then-play
 
@@ -48,53 +63,89 @@ sequential reads. `daemon/src/range_reader.rs` bridges that with real HTTP
 Range requests — a seek drops the current connection and lazily reissues a
 ranged GET for the new position on the next read, so no seek downloads more
 than the bytes actually needed, and playback can start before the whole file
-arrives. It degrades gracefully (read-and-discard) if the server ignores
-`Range` and returns the whole resource from byte 0 instead. See that file's
-tests for this verified against a real (if minimal) HTTP server, not mocked.
+arrives. Degrades gracefully (read-and-discard) if the server ignores
+`Range` and returns the whole resource from byte 0 instead.
+
+## Output device & ReplayGain
+
+- `maraetaid --list-devices` prints available audio output devices (safe
+  to run even while a daemon is already active). Put the name you want in
+  `output_device` in `config.toml`; matched by exact name or
+  case-insensitive substring, falling back to the system default on any
+  mismatch.
+- ReplayGain (track gain preferred over album gain) is applied
+  automatically when a song has tags for it — attenuate-only, never
+  amplified past a track's original level, since there's no peak limiter
+  here to catch clipping.
 
 ## Credentials
 
-Server URL + username live in `~/.config/maraetai/config.toml`. The password
-is stored in the OS keyring (`keyring` crate — Secret Service/KWallet on
-Linux), never on disk — the one thing every *other* maraetai client (except
-iOS's Keychain use) doesn't already do.
+Server URL + username live in `config.toml`, resolved automatically via the
+`directories` crate (`~/Library/Application Support/maraetai/config.toml` on
+macOS). The password itself is never written there — it's stored in the
+Keychain, looked up by username at connect time.
 
 ## Setup
 
 ```sh
-cargo build --workspace
-./target/debug/maraetai login       # prompts for server URL, username, password
-./target/debug/maraetai             # launches the TUI: browse albums, / to search,
-                                     # Enter to play, auto-spawning maraetaid
+xcode-select --install        # once, if you don't already have it — needed
+                               # to build native deps (Keychain bindings, TLS)
+cargo install --path daemon --locked
+cargo install --path tui --locked
+maraetai login                 # prompts for server URL, username, password
+maraetai                       # launches the TUI, auto-spawning maraetaid
 ```
 
-In the TUI: arrow keys/`j`/`k` to move, `Enter` to open a list or play from
-the selected song onward (queuing the rest of that list), `/` to search,
-`Esc`/`Backspace` to go back, `space` to play/pause, `n`/`p` for next/
-previous track, `s` to stop, `q` to quit (daemon keeps running), `Q` to quit
-and stop it.
+## Updating
 
-## Parity with the other maraetai clients
+```sh
+git pull
+cargo install --path daemon --locked
+cargo install --path tui --locked
+```
 
-| Feature | iOS/macOS | Android | Web | **TUI** |
-|---|---|---|---|---|
-| Browse albums/artists/playlists/genres | ✅ | ✅ | ✅ | ✅ |
-| Search | ✅ | ✅ | ✅ | ✅ *(songs only)* |
-| Playback (stream, seek, queue, next/previous) | ✅ | ✅ | ✅ | ✅ |
-| Favourites / playlists edit | ✅ | ✅ | ✅ | ❌ *(planned)* |
-| OS media-key / lock-screen integration | ✅ (native) | ✅ (native) | ❌ | ✅ (MPRIS, incl. Next/Previous) |
-| Credential storage | Keychain | SharedPreferences | localStorage (plaintext) | **OS keyring** |
-| Survives the app/window closing | n/a | n/a | ❌ | ✅ (daemon) |
+Then restart the daemon (`Q` in the TUI, or `maraetai daemon stop`) so it
+actually picks up the new build — reinstalling the binary doesn't affect a
+daemon already running in memory.
 
-## Scope: OUT (v1)
+## Keybindings
 
-- No favourites/playlist editing (create/rename/add-to/remove-from) — read
-  and play only.
-- No systemd/launchd unit shipped by default — spawn-on-demand +
-  idle-shutdown is the default experience, not an always-on service (see
-  above). A `--user` systemd unit could be a documented *optional* opt-in
-  later for people who want the daemon always warm.
-- Linux/D-Bus only — MPRIS has no equivalent on other platforms.
+Full reference is always available in-app via `?`. Highlights:
 
-See `.autofeature/designs/` for the full plan this was built from, including
-the reasoning behind each of these decisions.
+**Navigation** — `1`-`7` / `[`/`]` switch tabs, `Up`/`k` `Down`/`j` move,
+`Enter` open/play, `Esc`/`Backspace` back, `/` filter the current list.
+
+**Playback** — `space` play/pause, `n`/`p` next/previous, `Left`/`Right`
+seek, `-`/`+` volume, `r` cycle repeat, `x` toggle shuffle, `s` stop.
+
+**Queue** — `a` add to queue, `A` play next (right after the current
+track), `d` remove selected / `D` clear (Queue tab), `J`/`K` reorder,
+`S` save the queue as a playlist.
+
+**Playlists** — `N` new, `c` rename, `d` delete (Playlists tab), `P` add
+the selected song to a playlist, `d` remove a song from one you're
+viewing.
+
+**Selection & info** — `v` mark/unmark songs for a bulk action (`a`/`A`/
+`f`/`P`/`d` then act on everything marked), `f` toggle favorite, `t`
+toggle Albums sort (A-Z / newest), `e` expand a Home section, `i` artist
+bio/similar artists or album notes, `l` toggle the lyrics panel.
+
+**Other** — `q` quit (daemon keeps running), `Q` quit and stop it.
+
+## Out of scope (for now)
+
+- Gapless playback / crossfade — needs a real audio-engine rework
+  (pre-buffering the next track onto the same sink) that's risky enough to
+  want live-testing each step, deliberately deferred.
+- Podcasts / internet radio, offline download/caching.
+- Multiple accounts from within the TUI (one at a time, via `maraetai
+  login`).
+- No in-TUI output-device picker or a toggle to disable ReplayGain —
+  `output_device` is `config.toml`-only for now.
+- No launchd unit shipped by default — spawn-on-demand + idle-shutdown is
+  the default experience, not an always-on service.
+
+See `.autofeature/designs/` for the original Linux-only design this was
+built from — the reasoning there still holds for everything except the
+control-channel transport, which this fork changes as described above.
