@@ -64,7 +64,11 @@ pub fn acquire_single_instance_lock() -> Result<SingleInstanceGuard> {
 /// Deliberately checks `playback.is_playing()` on every tick, not just
 /// `take_activity()`: closing the terminal (so nothing is calling into the
 /// daemon any more) must not stop music that's still playing — "idle" means
-/// no playback *and* no client interaction, not just no client.
+/// no playback *and* no client interaction, not just no client. "Client
+/// interaction" specifically includes an open TUI merely polling `status()`
+/// (see `ControlInterface::status`/`PlaybackHandle::mark_client_activity`) —
+/// otherwise a TUI left open on a paused/stopped track for `timeout` looks
+/// identical to no client at all, and gets shut down out from under it.
 pub async fn run_idle_timer(playback: PlaybackHandle, shutdown: Arc<Notify>, timeout: Duration) {
     let check_interval = Duration::from_secs(30).min(timeout);
     let mut idle_for = Duration::ZERO;

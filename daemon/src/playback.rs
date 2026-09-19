@@ -323,6 +323,18 @@ impl PlaybackHandle {
         self.activity.swap(false, Ordering::SeqCst)
     }
 
+    /// Marks activity without sending any command to the engine — for
+    /// read-only control-channel calls (`status()`, polled by every
+    /// connected TUI every ~250ms) that should still count as "someone is
+    /// using this daemon" even though they don't change any playback
+    /// state. Without this, an open TUI sitting on a paused/stopped track
+    /// looks identical to no client at all, and the idle timer shuts the
+    /// daemon down out from under it — contradicting `run_idle_timer`'s
+    /// own documented intent ("no playback *and* no client interaction").
+    pub fn mark_client_activity(&self) {
+        self.activity.store(true, Ordering::SeqCst);
+    }
+
     /// True while a track is actually playing — the idle timer must never
     /// fire during active playback even with `take_activity() == false`
     /// (e.g. the terminal was closed, but music should keep going).
