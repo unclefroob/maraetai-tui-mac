@@ -24,6 +24,13 @@ pub struct Config {
     /// on its own. Absent/`None` means [`DEFAULT_IDLE_TIMEOUT_SECS`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idle_timeout_secs: Option<u64>,
+    /// The audio output device to use, by name — as reported by `maraetaid
+    /// --list-devices`. Absent/`None` means the system default. Matched
+    /// case-insensitively/by substring if the exact name has drifted (see
+    /// the daemon's `match_output_device`), so a config written against an
+    /// older device list usually still works.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_device: Option<String>,
 }
 
 impl Config {
@@ -125,15 +132,19 @@ impl Credentials {
     }
 
     /// Saves the config file and stores the password in the OS keyring. This
-    /// is the `maraetai login` flow. Preserves `idle_timeout_secs` from an
-    /// existing config, if any, rather than resetting it — `login` changes
-    /// credentials, not daemon tuning a user may have already customized.
+    /// is the `maraetai login` flow. Preserves `idle_timeout_secs`/
+    /// `output_device` from an existing config, if any, rather than
+    /// resetting them — `login` changes credentials, not daemon tuning a
+    /// user may have already customized.
     pub fn save(server_url: String, username: String, password: &str) -> Result<()> {
-        let idle_timeout_secs = Config::load().ok().and_then(|c| c.idle_timeout_secs);
+        let existing = Config::load().ok();
+        let idle_timeout_secs = existing.as_ref().and_then(|c| c.idle_timeout_secs);
+        let output_device = existing.and_then(|c| c.output_device);
         Config {
             server_url,
             username: username.clone(),
             idle_timeout_secs,
+            output_device,
         }
         .save()?;
         keyring_entry(&username)?.set_password(password)?;
@@ -157,6 +168,7 @@ mod tests {
             server_url: "https://music.example.com".into(),
             username: "alice".into(),
             idle_timeout_secs: Some(600),
+            output_device: Some("USB DAC".into()),
         };
         cfg.save_to(&path).unwrap();
         let loaded = Config::load_from(&path).unwrap();
@@ -184,6 +196,7 @@ mod tests {
             server_url: "https://music.example.com".into(),
             username: "alice".into(),
             idle_timeout_secs: None,
+            output_device: None,
         };
         let raw = toml::to_string(&cfg).unwrap();
         assert!(!raw.contains("password"));
@@ -195,6 +208,7 @@ mod tests {
             server_url: "https://music.example.com".into(),
             username: "alice".into(),
             idle_timeout_secs: None,
+            output_device: None,
         };
         assert_eq!(cfg.idle_timeout(), std::time::Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS));
     }
@@ -205,6 +219,7 @@ mod tests {
             server_url: "https://music.example.com".into(),
             username: "alice".into(),
             idle_timeout_secs: Some(60),
+            output_device: None,
         };
         assert_eq!(cfg.idle_timeout(), std::time::Duration::from_secs(60));
     }

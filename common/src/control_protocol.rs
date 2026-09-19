@@ -12,10 +12,19 @@
 use serde::{Deserialize, Serialize};
 
 /// One queue entry: (stream_url, title, artist, album, art_url,
-/// duration_secs, format_label, lossless, song_id). A plain tuple, not a
-/// named struct, so D-Bus/zvariant encode it with no extra wiring — see
-/// `daemon::control` for the field-by-field meaning.
-pub type QueueEntry = (String, String, String, String, String, f64, String, bool, String);
+/// duration_secs, format_label, lossless, song_id, replay_gain_db). A
+/// plain tuple, not a named struct, so D-Bus/zvariant encode it with no
+/// extra wiring — see `daemon::control` for the field-by-field meaning.
+///
+/// `replay_gain_db` is a plain `f64`, not `Option<f64>` — zvariant (as
+/// pulled in by the Linux/D-Bus transport that also uses this type) has no
+/// `Type` impl for `Option` over the classic D-Bus wire format (only
+/// GVariant's "maybe" type supports that, which this isn't using). `0.0`
+/// doubles as "no ReplayGain data": it's also exactly what a real 0 dB tag
+/// means, so the two cases are indistinguishable in their effect on
+/// playback anyway (both mean "no adjustment") — see
+/// `daemon::playback::replay_gain_scale`.
+pub type QueueEntry = (String, String, String, String, String, f64, String, bool, String, f64);
 
 /// One queue row for display: (title, artist, album, duration_secs,
 /// format_label, lossless, song_id).

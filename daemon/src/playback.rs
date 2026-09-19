@@ -111,6 +111,14 @@ pub struct TrackMeta {
     /// than duplicating that logic here.
     pub format_label: String,
     pub lossless: bool,
+    /// ReplayGain, in dB — the TUI resolves a `Song`'s track/album gain
+    /// down to this one value (see `library::Song::replay_gain_db`)
+    /// before it ever reaches here. `0.0` when the server sent neither, or
+    /// for a track played without library metadata at all — a plain `f64`
+    /// rather than `Option<f64>` since zvariant can't encode the latter
+    /// over classic D-Bus, and a real 0 dB tag would mean the same "no
+    /// adjustment" outcome anyway. See `replay_gain_scale`.
+    pub replay_gain_db: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -386,7 +394,7 @@ impl PlaybackHandle {
 /// the idle timer. `credentials` is `None` when the daemon starts before
 /// `maraetai login` has ever been run — scrobbling is then silently skipped,
 /// same as everything else that needs credentials.
-pub fn spawn(events: UnboundedSender<Event>, credentials: Option<Credentials>) -> PlaybackHandle {
+pub fn spawn(events: UnboundedSender<Event>, credentials: Option<Credentials>, output_device: Option<String>) -> PlaybackHandle {
     let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
     let snapshot = Arc::new(Mutex::new(Snapshot::default()));
     let activity = Arc::new(AtomicBool::new(false));
@@ -399,10 +407,88 @@ pub fn spawn(events: UnboundedSender<Event>, credentials: Option<Credentials>) -
 
     std::thread::Builder::new()
         .name("maraetai-audio".into())
-        .spawn(move || run_engine(cmd_rx, snapshot, events, credentials))
+        .spawn(move || run_engine(cmd_rx, snapshot, events, credentials, output_device))
         .expect("failed to spawn audio thread");
 
     handle
+}
+
+/// Converts a ReplayGain value in decibels into a linear volume multiplier
+/// (the standard `10^(dB/20)` conversion), clamped to never exceed 1.0 —
+/// deliberately attenuate-only, since amplifying a quiet track up to its
+/// ReplayGain target could clip without a peak limiter, which this engine
+/// doesn't have. `0.0` dB (no ReplayGain metadata, or a genuine 0 dB tag —
+/// see `TrackMeta::replay_gain_db`) is unity gain either way.
+fn replay_gain_scale(gain_db: f64) -> f32 {
+    (10f64.powf(gain_db / 20.0) as f32).min(1.0)
+}
+
+/// Picks the output device name (from `available`, as reported by the
+/// audio backend) that best matches `requested` — an exact match if one
+/// exists, else the first case-insensitive substring match (so a saved
+/// config value that's gone slightly stale, e.g. a USB interface that
+/// renumbered, still has a chance of matching), else `None` — the signal
+/// to fall back to the system default rather than fail outright.
+fn match_output_device<'a>(available: &'a [String], requested: &str) -> Option<&'a str> {
+    if let Some(exact) = available.iter().find(|n| n.as_str() == requested) {
+        return Some(exact.as_str());
+    }
+    let requested_lower = requested.to_lowercase();
+    available.iter().find(|n| n.to_lowercase().contains(&requested_lower)).map(String::as_str)
+}
+
+/// Opens the audio output stream — the system default, unless
+/// `output_device` names one to use instead (see `match_output_device`).
+/// Any failure to find or open the requested device falls back to the
+/// default rather than refusing to start playback at all.
+fn open_output_stream(output_device: Option<&str>) -> Result<OutputStream, rodio::StreamError> {
+    use rodio::cpal::traits::{DeviceTrait, HostTrait};
+
+    let Some(requested) = output_device else {
+        return OutputStreamBuilder::open_default_stream();
+    };
+    let host = rodio::cpal::default_host();
+    let names: Vec<String> = host.output_devices().map(|d| d.filter_map(|d| d.name().ok()).collect()).unwrap_or_default();
+    let Some(matched) = match_output_device(&names, requested).map(str::to_string) else {
+        tracing::warn!(requested, "no matching output device found — falling back to the default");
+        return OutputStreamBuilder::open_default_stream();
+    };
+    let device = host.output_devices().ok().and_then(|mut devices| devices.find(|d| d.name().map(|n| n == matched).unwrap_or(false)));
+    let Some(device) = device else {
+        tracing::warn!(requested, "matched output device disappeared before it could be opened — falling back to the default");
+        return OutputStreamBuilder::open_default_stream();
+    };
+    match OutputStreamBuilder::from_device(device).and_then(|b| b.open_stream()) {
+        Ok(stream) => Ok(stream),
+        Err(e) => {
+            tracing::warn!(requested, error = %e, "failed to open the requested output device — falling back to the default");
+            OutputStreamBuilder::open_default_stream()
+        }
+    }
+}
+
+/// Prints every available output device's name, marking the system
+/// default — for `maraetaid --list-devices`, so a user has the exact
+/// string to put in `output_device` in their config. Doesn't touch the
+/// single-instance lock or open a stream, so it's safe to run alongside
+/// an already-running daemon.
+pub fn list_output_devices() {
+    use rodio::cpal::traits::{DeviceTrait, HostTrait};
+
+    let host = rodio::cpal::default_host();
+    let default_name = host.default_output_device().and_then(|d| d.name().ok());
+    let Ok(devices) = host.output_devices() else {
+        eprintln!("could not list output devices");
+        return;
+    };
+    for device in devices {
+        let Ok(name) = device.name() else { continue };
+        if Some(&name) == default_name.as_ref() {
+            println!("{name} (default)");
+        } else {
+            println!("{name}");
+        }
+    }
 }
 
 struct EngineState {
@@ -439,6 +525,12 @@ struct EngineState {
     current: Option<TrackMeta>,
     /// `None` until `maraetai login` has been run.
     credentials: Option<Credentials>,
+    /// The user's own volume setting (0.0-1.0), independent of the
+    /// `Snapshot`'s copy of the same value — kept here too because a fresh
+    /// `Sink` (built for every track, in `start_playback_at`) doesn't
+    /// inherit whatever the *previous* sink's volume was, and needs this
+    /// re-applied (combined with `replay_gain_scale`) every time.
+    volume: f32,
 }
 
 fn run_engine(
@@ -446,8 +538,9 @@ fn run_engine(
     snapshot: Arc<Mutex<Snapshot>>,
     events: UnboundedSender<Event>,
     credentials: Option<Credentials>,
+    output_device: Option<String>,
 ) {
-    let stream = match OutputStreamBuilder::open_default_stream() {
+    let stream = match open_output_stream(output_device.as_deref()) {
         Ok(stream) => stream,
         Err(e) => {
             tracing::error!("no audio output device available: {e}");
@@ -471,6 +564,7 @@ fn run_engine(
         current_format: None,
         current: None,
         credentials,
+        volume: 1.0,
     };
 
     loop {
@@ -654,8 +748,10 @@ fn run_engine(
                 }
             }
             Ok(Command::SetVolume(v)) => {
+                state.volume = v;
                 if let Some(sink) = &state.sink {
-                    sink.set_volume(v);
+                    let gain = state.current.as_ref().map(|t| t.replay_gain_db).unwrap_or(0.0);
+                    sink.set_volume(v * replay_gain_scale(gain));
                 }
                 snapshot.lock().expect("poisoned").volume = v;
             }
@@ -818,6 +914,10 @@ fn start_playback_at(
 
     let sink = Sink::connect_new(state.stream.mixer());
     sink.append(tapped);
+    // A fresh sink doesn't inherit the previous one's volume — re-apply
+    // the user's own setting, combined with this track's ReplayGain scale
+    // (see `replay_gain_scale`).
+    sink.set_volume(state.volume * replay_gain_scale(meta.replay_gain_db));
     {
         let mut snap = snapshot.lock().expect("poisoned");
         snap.status = Status::Playing;
@@ -950,6 +1050,50 @@ mod tests {
     use std::sync::mpsc as std_mpsc;
 
     use super::*;
+
+    #[test]
+    fn replay_gain_scale_of_zero_db_is_unity() {
+        assert_eq!(replay_gain_scale(0.0), 1.0);
+    }
+
+    #[test]
+    fn replay_gain_scale_attenuates_a_negative_gain() {
+        // -6 dB is very close to half amplitude (10^(-6/20) ≈ 0.501).
+        assert!((replay_gain_scale(-6.0) - 0.501).abs() < 0.01);
+    }
+
+    #[test]
+    fn replay_gain_scale_never_amplifies_past_unity() {
+        // A positive gain (a quiet track that ReplayGain would normally
+        // boost) is clamped to 1.0 rather than actually amplified — see
+        // the doc comment: no peak limiter here, so amplifying risks
+        // clipping.
+        assert_eq!(replay_gain_scale(6.0), 1.0);
+    }
+
+    #[test]
+    fn match_output_device_prefers_an_exact_match() {
+        let available = vec!["USB DAC".to_string(), "USB DAC (2)".to_string()];
+        assert_eq!(match_output_device(&available, "USB DAC"), Some("USB DAC"));
+    }
+
+    #[test]
+    fn match_output_device_falls_back_to_a_substring_match() {
+        let available = vec!["HDA Intel PCH: ALC1220 Analog".to_string()];
+        assert_eq!(match_output_device(&available, "ALC1220"), Some("HDA Intel PCH: ALC1220 Analog"));
+    }
+
+    #[test]
+    fn match_output_device_is_case_insensitive() {
+        let available = vec!["USB DAC".to_string()];
+        assert_eq!(match_output_device(&available, "usb dac"), Some("USB DAC"));
+    }
+
+    #[test]
+    fn match_output_device_returns_none_when_nothing_matches() {
+        let available = vec!["USB DAC".to_string()];
+        assert_eq!(match_output_device(&available, "Bluetooth Headphones"), None);
+    }
 
     #[test]
     fn scrobble_threshold_is_half_the_track_for_short_songs() {

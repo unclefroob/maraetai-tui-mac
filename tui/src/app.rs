@@ -186,6 +186,32 @@ struct HomeSection {
     songs: Vec<Song>,
 }
 
+/// Which `getAlbumList2` ordering the top-level Albums tab is showing —
+/// toggled with `t`. Only meaningful there: an artist's or genre's albums
+/// (also `Screen::AlbumList`, just from a different endpoint) have no
+/// sort of their own, hence `Screen::AlbumList::sort` being an `Option`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AlbumSort {
+    Alphabetical,
+    Newest,
+}
+
+impl AlbumSort {
+    fn toggled(self) -> Self {
+        match self {
+            AlbumSort::Alphabetical => AlbumSort::Newest,
+            AlbumSort::Newest => AlbumSort::Alphabetical,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            AlbumSort::Alphabetical => "A-Z",
+            AlbumSort::Newest => "Newest",
+        }
+    }
+}
+
 enum Screen {
     AlbumList {
         title: String,
@@ -196,6 +222,10 @@ enum Screen {
         /// `handle_filter_edit`). `selected` is a position within the
         /// *filtered* view, not a raw index — see `visible_indices`.
         filter: String,
+        /// `Some` only for the top-level Albums tab, where `t` toggles it
+        /// (see `AlbumSort`) — `None` for an artist's or genre's albums,
+        /// which have no sort of their own.
+        sort: Option<AlbumSort>,
     },
     SongList {
         title: String,
@@ -208,6 +238,12 @@ enum Screen {
         /// Lets `d` mean "remove this song from the playlist" specifically
         /// here, rather than everywhere a `SongList` is shown.
         playlist_id: Option<String>,
+        /// Song ids marked with `v` — bulk actions (`a`/`f`/`P`/`d`, and
+        /// `Enter`) act on all of these instead of just the row under the
+        /// cursor whenever this isn't empty. Tracked by id rather than
+        /// index so marks survive filtering and any list mutation. See
+        /// `App::toggle_mark`.
+        marked: Vec<String>,
     },
     ArtistList {
         artists: Vec<Artist>,
@@ -229,6 +265,8 @@ enum Screen {
         editing: bool,
         results: Vec<Song>,
         selected: usize,
+        /// See `Screen::SongList::marked`.
+        marked: Vec<String>,
     },
     /// The daemon's actual current queue — `Enter` jumps straight to that
     /// track via `PlayAt`, unlike other lists which start a *new* queue.
@@ -249,21 +287,28 @@ enum Screen {
         selected: usize,
     },
     /// "Which playlist?" — pushed by `P` ("add to playlist") on top of
-    /// whatever screen the selected song came from; `Enter` adds `song_id`
-    /// to the chosen playlist and pops back to that screen.
+    /// whatever screen the selected song(s) came from; `Enter` adds every
+    /// id in `song_ids` (just one, outside multi-select) to the chosen
+    /// playlist and pops back to that screen.
     PlaylistPicker {
         playlists: Vec<Playlist>,
         selected: usize,
-        song_id: String,
+        song_ids: Vec<String>,
     },
     /// A scrollable block of text — artist biography + similar artists, or
-    /// album notes (`i`, see `App::show_artist_info`/`show_album_info`).
-    /// Generic rather than two separate variants since both are just "some
-    /// text to read," with no other interaction.
+    /// album notes (`i`, see `App::show_info`). Generic rather than two
+    /// separate variants since both are ultimately "some text to read"
+    /// plus an optional list of jump targets. When `similar_artists` isn't
+    /// empty (only ever for artist info), `Up`/`Down` browse it instead of
+    /// scrolling `body`, and `Enter` opens the selected one's albums —
+    /// otherwise `Up`/`Down` scroll `body` and `Enter` does nothing (album
+    /// notes have nothing to jump to).
     Info {
         title: String,
         body: String,
         scroll: usize,
+        similar_artists: Vec<library::SimilarArtist>,
+        similar_selected: usize,
     },
 }
 
@@ -625,7 +670,14 @@ impl App<'_> {
                 }
                 KeyCode::Char('a') => self.append_selection().await,
                 KeyCode::Char('f') => self.toggle_star().await,
+                // Marks/unmarks the selected song for a bulk action — see
+                // `toggle_mark` and `marked_songs`.
+                KeyCode::Char('v') => self.toggle_mark(),
                 KeyCode::Char('e') => self.expand_home_section(terminal).await,
+                // Toggles the Albums tab between alphabetical and
+                // most-recently-added order — a no-op anywhere else (an
+                // artist's/genre's albums have no sort of their own).
+                KeyCode::Char('t') => self.toggle_album_sort(terminal).await,
                 // Toggles the lyrics panel; it only actually renders while
                 // there's a current track (see `draw`), but the flag itself
                 // flips regardless, so it's already open the next time
@@ -820,7 +872,13 @@ impl App<'_> {
                     .load(terminal, "Loading albums…", |c| Box::pin(async move { c.albums().await }))
                     .await
                     .unwrap_or_default();
-                self.stack.push(Screen::AlbumList { title: "Albums".into(), albums, selected: 0, filter: String::new() });
+                self.stack.push(Screen::AlbumList {
+                    title: "Albums".into(),
+                    albums,
+                    selected: 0,
+                    filter: String::new(),
+                    sort: Some(AlbumSort::Alphabetical),
+                });
             }
             Tab::Artists => {
                 let artists = self
@@ -880,6 +938,7 @@ impl App<'_> {
                     editing: true,
                     results: Vec::new(),
                     selected: 0,
+                    marked: Vec::new(),
                 });
             }
             Tab::Queue => {
@@ -925,6 +984,7 @@ impl App<'_> {
             selected: 0,
             filter: String::new(),
             playlist_id: None,
+            marked: Vec::new(),
         });
     }
 
@@ -1109,10 +1169,16 @@ impl App<'_> {
                 }
                 return;
             }
-            // Scrolls a line count, same convention Lyrics used to use
-            // before it became a panel.
-            Some(Screen::Info { scroll, .. }) => {
-                *scroll = (*scroll as i32 + delta).max(0) as usize;
+            // With similar artists to browse, Up/Down move through those
+            // instead of scrolling the body text (see `Screen::Info`'s doc
+            // comment) — otherwise this scrolls a line count, same
+            // convention Lyrics used to use before it became a panel.
+            Some(Screen::Info { scroll, similar_artists, similar_selected, .. }) => {
+                if similar_artists.is_empty() {
+                    *scroll = (*scroll as i32 + delta).max(0) as usize;
+                } else {
+                    *similar_selected = (*similar_selected as i32 + delta).rem_euclid(similar_artists.len() as i32) as usize;
+                }
                 return;
             }
             _ => {}
@@ -1137,6 +1203,14 @@ impl App<'_> {
     }
 
     async fn activate_selection(&mut self, terminal: &mut ratatui::DefaultTerminal) {
+        // Marked songs (`v`) take over Enter entirely: play all of them as
+        // a fresh queue, rather than "this song and the rest of the list"
+        // — the single-selection behavior below.
+        if let Some(songs) = self.marked_songs() {
+            self.play_from(songs, 0).await;
+            self.clear_marks();
+            return;
+        }
         if let Screen::Search { results, selected, editing, .. } = self.top() {
             if !*editing && !results.is_empty() {
                 self.play_from(results.clone(), *selected).await;
@@ -1155,14 +1229,35 @@ impl App<'_> {
             }
             return;
         }
-        if let Screen::PlaylistPicker { playlists, selected, song_id } = self.top() {
+        if let Screen::PlaylistPicker { playlists, selected, song_ids } = self.top() {
             let Some(playlist) = playlists.get(*selected).cloned() else { return };
-            let song_id = song_id.clone();
-            match self.library.add_song_to_playlist(&playlist.id, &song_id).await {
-                Ok(()) => self.message = format!("added to \"{}\"", playlist.name),
-                Err(e) => self.message = format!("could not add to playlist: {e}"),
+            let song_ids = song_ids.clone();
+            let mut ok = 0;
+            for song_id in &song_ids {
+                if self.library.add_song_to_playlist(&playlist.id, song_id).await.is_ok() {
+                    ok += 1;
+                }
             }
+            self.message = if ok == song_ids.len() {
+                format!("added {ok} to \"{}\"", playlist.name)
+            } else {
+                format!("added {ok}/{}, {} failed, to \"{}\"", song_ids.len(), song_ids.len() - ok, playlist.name)
+            };
             self.stack.pop();
+            self.clear_marks();
+            return;
+        }
+        // Jumps to a similar artist's albums — a no-op (falls through to
+        // the generic match's catch-all) when there's nothing to jump to,
+        // i.e. album notes, which never have any.
+        if let Screen::Info { similar_artists, similar_selected, .. } = self.top() {
+            if let Some(artist) = similar_artists.get(*similar_selected).cloned() {
+                self.push_album_list(terminal, artist.name.clone(), |c| {
+                    let id = artist.id.clone();
+                    Box::pin(async move { c.artist_albums(&id).await })
+                })
+                .await;
+            }
             return;
         }
         let visible = self.visible_indices();
@@ -1256,6 +1351,27 @@ impl App<'_> {
         }
     }
 
+    /// `t`: flips the top-level Albums tab between alphabetical and
+    /// most-recently-added order, re-fetching from the matching endpoint —
+    /// a no-op anywhere `sort` is `None` (an artist's/genre's albums).
+    async fn toggle_album_sort(&mut self, terminal: &mut ratatui::DefaultTerminal) {
+        let Screen::AlbumList { sort: Some(sort), .. } = self.top() else { return };
+        let new_sort = sort.toggled();
+        let albums = self
+            .load(terminal, "Loading albums…", |c| match new_sort {
+                AlbumSort::Alphabetical => Box::pin(async move { c.albums().await }),
+                AlbumSort::Newest => Box::pin(async move { c.newest_albums().await }),
+            })
+            .await
+            .unwrap_or_default();
+        if let Some(Screen::AlbumList { albums: a, selected, sort: s, filter, .. }) = self.stack.last_mut() {
+            *a = albums;
+            *selected = 0;
+            *s = Some(new_sort);
+            filter.clear();
+        }
+    }
+
     /// The Subsonic song id under the cursor on whichever screen is on top,
     /// if that screen shows songs at all — used by `P` ("add to
     /// playlist"), which only needs an id, not a full `Song` (so it also
@@ -1279,18 +1395,68 @@ impl App<'_> {
         }
     }
 
+    /// The full `Song`s behind the top screen's marked ids (`v`, see
+    /// `Screen::SongList::marked`), in their underlying list's order —
+    /// `None` when the top screen isn't `SongList`/`Search` or simply has
+    /// nothing marked, the signal every bulk-capable action (`a`/`f`/`P`/
+    /// `Enter`) uses to fall back to its single-selection behavior.
+    fn marked_songs(&self) -> Option<Vec<Song>> {
+        let (songs, marked) = match self.top() {
+            Screen::SongList { songs, marked, .. } => (songs, marked),
+            Screen::Search { results, marked, .. } => (results, marked),
+            _ => return None,
+        };
+        if marked.is_empty() {
+            return None;
+        }
+        Some(songs.iter().filter(|s| marked.contains(&s.id)).cloned().collect())
+    }
+
+    /// Clears the top screen's marks, if it has any — called once a
+    /// bulk action (`a`/`f`/`P`/`Enter`) actually completes, so marks don't
+    /// linger onto an unrelated later action.
+    fn clear_marks(&mut self) {
+        if let Some(Screen::SongList { marked, .. } | Screen::Search { marked, .. }) = self.stack.last_mut() {
+            marked.clear();
+        }
+    }
+
+    /// `v`: marks/unmarks the song under the cursor for a bulk action — a
+    /// no-op anywhere but `SongList`/`Search`.
+    fn toggle_mark(&mut self) {
+        let visible = self.visible_indices();
+        let (songs, selected, marked) = match self.stack.last_mut() {
+            Some(Screen::SongList { songs, selected, marked, .. }) => (songs, selected, marked),
+            Some(Screen::Search { results, selected, editing, marked, .. }) if !*editing => (results, selected, marked),
+            _ => return,
+        };
+        let Some(&real) = visible.get(*selected) else { return };
+        let Some(song) = songs.get(real) else { return };
+        if let Some(pos) = marked.iter().position(|id| id == &song.id) {
+            marked.remove(pos);
+        } else {
+            marked.push(song.id.clone());
+        }
+    }
+
     /// `P`: opens a "which playlist?" picker for the selected song — pushed
     /// on top of whatever screen it's called from, popped again once
     /// `activate_selection` adds the song (or `Esc` cancels). A no-op with
     /// nothing selectable, or if the user has no playlists yet to add to.
     async fn open_playlist_picker(&mut self, terminal: &mut ratatui::DefaultTerminal) {
-        let Some(song_id) = self.selected_song_id() else { return };
+        let song_ids = match self.marked_songs() {
+            Some(songs) => songs.into_iter().map(|s| s.id).collect(),
+            None => match self.selected_song_id() {
+                Some(id) => vec![id],
+                None => return,
+            },
+        };
         let playlists = self.load(terminal, "Loading playlists…", |c| Box::pin(async move { c.playlists().await })).await.unwrap_or_default();
         if playlists.is_empty() {
             self.message = "no playlists yet — press N on the Playlists tab to create one".to_string();
             return;
         }
-        self.stack.push(Screen::PlaylistPicker { playlists, selected: 0, song_id });
+        self.stack.push(Screen::PlaylistPicker { playlists, selected: 0, song_ids });
     }
 
     /// `N`: opens the "new playlist" name prompt — Playlists tab only.
@@ -1337,16 +1503,32 @@ impl App<'_> {
                     Err(e) => self.message = format!("could not delete playlist: {e}"),
                 }
             }
-            Screen::SongList { playlist_id: Some(playlist_id), selected, .. } => {
-                let Some(&real) = visible.get(*selected) else { return };
+            Screen::SongList { playlist_id: Some(playlist_id), songs, selected, marked, .. } => {
                 let playlist_id = playlist_id.clone();
-                match self.library.remove_song_from_playlist(&playlist_id, real).await {
-                    Ok(()) => {
-                        self.message = "removed from playlist".to_string();
-                        self.refresh_playlist_songs(terminal, &playlist_id).await;
+                // Marked songs are removed by index too (Subsonic has no
+                // by-id removal) — highest index first, so an earlier
+                // removal never shifts an index still waiting to be
+                // removed.
+                let mut indices: Vec<usize> = if marked.is_empty() {
+                    let Some(&real) = visible.get(*selected) else { return };
+                    vec![real]
+                } else {
+                    songs.iter().enumerate().filter(|(_, s)| marked.contains(&s.id)).map(|(i, _)| i).collect()
+                };
+                indices.sort_unstable_by(|a, b| b.cmp(a));
+                let mut ok = 0;
+                for index in &indices {
+                    if self.library.remove_song_from_playlist(&playlist_id, *index).await.is_ok() {
+                        ok += 1;
                     }
-                    Err(e) => self.message = format!("could not remove from playlist: {e}"),
                 }
+                self.message = if ok == indices.len() {
+                    format!("removed {ok} from playlist")
+                } else {
+                    format!("removed {ok}/{}, {} failed", indices.len(), indices.len() - ok)
+                };
+                self.refresh_playlist_songs(terminal, &playlist_id).await;
+                self.clear_marks();
             }
             Screen::Queue { selected, .. } => {
                 let Some(&real) = visible.get(*selected) else { return };
@@ -1468,14 +1650,14 @@ impl App<'_> {
                     })
                     .await
                     .unwrap_or_default();
-                let mut body = if info.biography.is_empty() { "No biography available.".to_string() } else { info.biography };
-                if !info.similar_artists.is_empty() {
-                    body.push_str("\n\nSimilar artists:\n");
-                    for s in &info.similar_artists {
-                        body.push_str(&format!(" - {}\n", s.name));
-                    }
-                }
-                self.stack.push(Screen::Info { title: artist.name, body, scroll: 0 });
+                let body = if info.biography.is_empty() { "No biography available.".to_string() } else { info.biography };
+                self.stack.push(Screen::Info {
+                    title: artist.name,
+                    body,
+                    scroll: 0,
+                    similar_artists: info.similar_artists,
+                    similar_selected: 0,
+                });
             }
             Screen::AlbumList { albums, selected, .. } => {
                 let visible = self.visible_indices();
@@ -1488,13 +1670,18 @@ impl App<'_> {
                     .await
                     .unwrap_or_default();
                 let body = if info.notes.is_empty() { "No notes available.".to_string() } else { info.notes };
-                self.stack.push(Screen::Info { title: album.name, body, scroll: 0 });
+                self.stack.push(Screen::Info { title: album.name, body, scroll: 0, similar_artists: Vec::new(), similar_selected: 0 });
             }
             _ => {}
         }
     }
 
     async fn append_selection(&mut self) {
+        if let Some(songs) = self.marked_songs() {
+            self.append_from(songs, 0).await;
+            self.clear_marks();
+            return;
+        }
         // Home's `selected` already indexes directly into its (unfiltered,
         // capped-preview) section, unlike the other screens below.
         if let Screen::Home { sections, section, selected } = self.top() {
@@ -1527,6 +1714,11 @@ impl App<'_> {
     /// updating the local copy so the star glyph flips immediately rather
     /// than waiting on a re-fetch.
     async fn toggle_star(&mut self) {
+        if let Some(songs) = self.marked_songs() {
+            self.bulk_toggle_star(songs).await;
+            self.clear_marks();
+            return;
+        }
         // Home's `selected` already indexes directly into its section,
         // unlike the filtered screens below (see `visible_indices`).
         let home_section = if let Screen::Home { section, .. } = self.top() { Some(*section) } else { None };
@@ -1565,6 +1757,39 @@ impl App<'_> {
         }
     }
 
+    /// `f` with marks present: sets every marked song to the same starred
+    /// state — starred if any of them isn't already, unstarred only once
+    /// every one of them already is. The common "select some, mark them
+    /// all the same way" bulk convention, rather than an ambiguous
+    /// per-song toggle where the visual result wouldn't be uniform.
+    async fn bulk_toggle_star(&mut self, songs: Vec<Song>) {
+        let new_starred = songs.iter().any(|s| !s.is_starred());
+        let mut ok = 0;
+        for song in &songs {
+            if self.library.set_starred(&song.id, new_starred).await.is_ok() {
+                ok += 1;
+            }
+        }
+        let ids: Vec<&str> = songs.iter().map(|s| s.id.as_str()).collect();
+        let update = |list: &mut [Song]| {
+            for song in list.iter_mut() {
+                if ids.contains(&song.id.as_str()) {
+                    song.starred = new_starred.then(String::new);
+                }
+            }
+        };
+        match self.stack.last_mut() {
+            Some(Screen::SongList { songs, .. }) => update(songs),
+            Some(Screen::Search { results, .. }) => update(results),
+            _ => {}
+        }
+        self.message = if ok == songs.len() {
+            format!("updated {ok} favorite(s)")
+        } else {
+            format!("updated {ok}/{}, {} failed", songs.len(), songs.len() - ok)
+        };
+    }
+
     #[allow(clippy::type_complexity)]
     async fn load<T>(
         &mut self,
@@ -1598,7 +1823,7 @@ impl App<'_> {
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<Vec<Album>>> + '_>>,
     ) {
         if let Some(albums) = self.load(terminal, &format!("Loading {title}…"), fetch).await {
-            self.stack.push(Screen::AlbumList { title, albums, selected: 0, filter: String::new() });
+            self.stack.push(Screen::AlbumList { title, albums, selected: 0, filter: String::new(), sort: None });
         }
     }
 
@@ -1613,7 +1838,7 @@ impl App<'_> {
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<Vec<Song>>> + '_>>,
     ) {
         if let Some(songs) = self.load(terminal, &format!("Loading {title}…"), fetch).await {
-            self.stack.push(Screen::SongList { title, songs, selected: 0, filter: String::new(), playlist_id });
+            self.stack.push(Screen::SongList { title, songs, selected: 0, filter: String::new(), playlist_id, marked: Vec::new() });
         }
     }
 
@@ -1677,6 +1902,7 @@ impl App<'_> {
                     format_label,
                     lossless,
                     s.id.clone(),
+                    s.replay_gain_db(),
                 )
             })
             .collect()
@@ -1718,22 +1944,27 @@ impl App<'_> {
 
         let visible = self.visible_indices();
         match self.top() {
-            Screen::AlbumList { title, albums, selected, filter } => {
+            Screen::AlbumList { title, albums, selected, filter, sort } => {
                 let items = visible.iter().map(|&i| format!("{}  —  {}", albums[i].name, albums[i].artist));
-                self.draw_list(frame, chunks[1], &filter_hint_title(title, filter, self.filter_editing, "[Enter] open  [Esc] back"), items, *selected);
+                let (title, hint) = match sort {
+                    Some(sort) => (format!("{title} ({})", sort.label()), "[Enter] open  [t] toggle sort  [Esc] back"),
+                    None => (title.clone(), "[Enter] open  [Esc] back"),
+                };
+                self.draw_list(frame, chunks[1], &filter_hint_title(&title, filter, self.filter_editing, hint), items, *selected);
             }
-            Screen::SongList { title, songs, selected, filter, playlist_id } => {
+            Screen::SongList { title, songs, selected, filter, playlist_id, marked } => {
                 let rows = visible.iter().map(|&i| {
                     let s = &songs[i];
                     let (fmt, lossless) = library::format_label(&s.suffix, s.bit_rate);
-                    (s.title.as_str(), s.artist.as_str(), s.album.as_str(), s.duration, fmt, lossless, s.is_starred())
+                    (s.title.as_str(), s.artist.as_str(), s.album.as_str(), s.duration, fmt, lossless, s.is_starred(), marked.contains(&s.id))
                 });
-                let hint = if playlist_id.is_some() {
-                    "[Enter] play  [a]dd  [f]avorite  [P]laylist  [d]elete  [Esc] back"
+                let delete_hint = if playlist_id.is_some() { "  [d]elete" } else { "" };
+                let hint = if marked.is_empty() {
+                    format!("[Enter] play  [v] mark  [a]dd  [f]avorite  [P]laylist{delete_hint}  [Esc] back")
                 } else {
-                    "[Enter] play  [a]dd  [f]avorite  [P]laylist  [Esc] back"
+                    format!("{} marked — [Enter] play all  [v] unmark  [a]dd all  [f]avorite all  [P]laylist all{delete_hint}  [Esc] back", marked.len())
                 };
-                let title = filter_hint_title(title, filter, self.filter_editing, hint);
+                let title = filter_hint_title(title, filter, self.filter_editing, &hint);
                 self.draw_song_table(frame, chunks[1], &title, rows, *selected, &now_playing.title);
             }
             Screen::ArtistList { artists, selected, filter } => {
@@ -1757,22 +1988,24 @@ impl App<'_> {
                 });
                 self.draw_list(frame, chunks[1], &filter_hint_title("Genres", filter, self.filter_editing, "[Enter] open  [Esc] back"), items, *selected);
             }
-            Screen::Search { query, editing, results, selected } => {
+            Screen::Search { query, editing, results, selected, marked } => {
                 let title = if *editing {
                     format!(" Search: {query}_  [Enter] run  [Esc] stop editing ")
+                } else if marked.is_empty() {
+                    format!(" Search: {query}  [Enter] play  [v] mark  [a]dd  [f]avorite  [P]laylist  [/] new search ")
                 } else {
-                    format!(" Search: {query}  [Enter] play  [a]dd  [f]avorite  [/] new search ")
+                    format!(" Search: {query}  {} marked — [Enter] play all  [v] unmark  [a]dd all  [f]avorite all  [P]laylist all  [/] new search ", marked.len())
                 };
                 let rows = results.iter().map(|s| {
                     let (fmt, lossless) = library::format_label(&s.suffix, s.bit_rate);
-                    (s.title.as_str(), s.artist.as_str(), s.album.as_str(), s.duration, fmt, lossless, s.is_starred())
+                    (s.title.as_str(), s.artist.as_str(), s.album.as_str(), s.duration, fmt, lossless, s.is_starred(), marked.contains(&s.id))
                 });
                 self.draw_song_table(frame, chunks[1], &title, rows, *selected, &now_playing.title);
             }
             Screen::Queue { tracks, selected, filter } => {
                 let rows = visible.iter().map(|&i| {
                     let (t, a, al, d, fmt, lossless, _song_id) = &tracks[i];
-                    (t.as_str(), a.as_str(), al.as_str(), *d, fmt.clone(), *lossless, false)
+                    (t.as_str(), a.as_str(), al.as_str(), *d, fmt.clone(), *lossless, false, false)
                 });
                 let hint = "[Enter] jump  [J/K] move  [d]elete  [D] clear  [S]ave as playlist  [P]laylist  [Esc] back";
                 let title = filter_hint_title("Queue", filter, self.filter_editing, hint);
@@ -1785,8 +2018,8 @@ impl App<'_> {
                 let items = playlists.iter().map(|p| format!("{}  ({} songs)", p.name, p.song_count));
                 self.draw_list(frame, chunks[1], " Add to playlist — [Enter] add  [Esc] cancel ", items, *selected);
             }
-            Screen::Info { title, body, scroll } => {
-                self.draw_info(frame, chunks[1], title, body, *scroll);
+            Screen::Info { title, body, scroll, similar_artists, similar_selected } => {
+                self.draw_info(frame, chunks[1], title, body, *scroll, similar_artists, *similar_selected);
             }
         }
 
@@ -1805,8 +2038,10 @@ impl App<'_> {
             ("Up/k Down/j", "move selection"),
             ("Enter", "open / play from here"),
             ("a", "add to queue (don't replace it)"),
-            ("f", "toggle favorite on the selected song"),
+            ("f", "toggle favorite on the selected song(s)"),
+            ("v", "mark/unmark for a bulk action (Enter/a/f/P/d act on all marked)"),
             ("e", "expand a Home section into its full list"),
+            ("t", "toggle Albums sort: A-Z / newest"),
             ("l", "toggle the lyrics panel (while something's playing)"),
             ("i", "artist bio / album notes (Artists, Albums)"),
             ("P", "add the selected song to a playlist"),
@@ -1871,24 +2106,32 @@ impl App<'_> {
     /// Format / Time, duration right-aligned, rmpc's convention — with the
     /// currently-playing row (matched by title, the only stable identifier
     /// available client-side) highlighted regardless of cursor position.
-    /// Lossless formats are green; lossy ones use the row's own color.
+    /// Lossless formats are green; lossy ones use the row's own color;
+    /// marked rows (`v`, multi-select — see `Screen::SongList::marked`)
+    /// get a leading checkmark ahead of any star.
     fn draw_song_table<'r>(
         &self,
         frame: &mut Frame,
         area: Rect,
         title: &str,
-        rows: impl Iterator<Item = (&'r str, &'r str, &'r str, f64, String, bool, bool)>,
+        rows: impl Iterator<Item = (&'r str, &'r str, &'r str, f64, String, bool, bool, bool)>,
         selected: usize,
         now_playing_title: &str,
     ) {
         let mut len = 0;
         let table_rows: Vec<Row> = rows
-            .map(|(t, artist, album, dur, format, lossless, starred)| {
+            .map(|(t, artist, album, dur, format, lossless, starred, marked)| {
                 len += 1;
                 let is_playing = !now_playing_title.is_empty() && t == now_playing_title;
                 let row_style = if is_playing { theme::now_playing_row() } else { Style::default() };
                 let format_style = if lossless { theme::lossless() } else { row_style };
-                let title_text = if starred { format!("\u{2605} {t}") } else { t.to_string() };
+                let mut title_text = t.to_string();
+                if starred {
+                    title_text = format!("\u{2605} {title_text}");
+                }
+                if marked {
+                    title_text = format!("\u{2713} {title_text}");
+                }
                 let title_style = if starred { theme::state_tag() } else { row_style };
                 Row::new(vec![
                     Cell::from(artist.to_string()),
@@ -1984,16 +2227,52 @@ impl App<'_> {
         }
     }
 
-    /// A scrollable block of plain text — artist biography/similar artists
-    /// or album notes (`i`, see `App::show_info`). Wrapped rather than
-    /// truncated, since biography text is prose, not a fixed-width table
-    /// row.
-    fn draw_info(&self, frame: &mut Frame, area: Rect, title: &str, body: &str, scroll: usize) {
-        let block = rounded_block(format!(" {title} — [Up/Down] scroll  [Esc] back "));
+    /// A scrollable block of plain text (`i`, see `App::show_info`) —
+    /// biography/notes wrapped rather than truncated, since it's prose, not
+    /// a fixed-width table row. When there are similar artists to jump to,
+    /// they render as their own selectable list underneath, sized to fit
+    /// them (capped at half the available height) rather than always
+    /// claiming a fixed amount of space.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_info(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        title: &str,
+        body: &str,
+        scroll: usize,
+        similar_artists: &[library::SimilarArtist],
+        similar_selected: usize,
+    ) {
+        let hint =
+            if similar_artists.is_empty() { "[Up/Down] scroll  [Esc] back" } else { "[Up/Down] browse similar  [Enter] open  [Esc] back" };
+        let block = rounded_block(format!(" {title} — {hint} "));
         let inner = block.inner(area);
         frame.render_widget(block, area);
-        let paragraph = Paragraph::new(body.to_string()).wrap(Wrap { trim: false }).scroll((scroll as u16, 0));
-        frame.render_widget(paragraph, inner);
+
+        if similar_artists.is_empty() {
+            let paragraph = Paragraph::new(body.to_string()).wrap(Wrap { trim: false }).scroll((scroll as u16, 0));
+            frame.render_widget(paragraph, inner);
+            return;
+        }
+
+        let similar_height = (similar_artists.len() as u16 + 2).min(inner.height / 2).max(3);
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(3), Constraint::Length(similar_height)])
+            .split(inner);
+
+        frame.render_widget(Paragraph::new(body.to_string()).wrap(Wrap { trim: false }), chunks[0]);
+
+        let items: Vec<ListItem> = similar_artists
+            .iter()
+            .enumerate()
+            .map(|(i, a)| {
+                let style = if i == similar_selected { theme::selected() } else { Style::default() };
+                ListItem::new(a.name.clone()).style(style)
+            })
+            .collect();
+        frame.render_widget(List::new(items).block(rounded_block(" Similar artists ")), chunks[1]);
     }
 
     /// Renders whatever's in `self.lyrics` for the current track, in the
@@ -2270,6 +2549,7 @@ mod tests {
             suffix: String::new(),
             bit_rate: None,
             starred: None,
+            replay_gain: None,
         }
     }
 

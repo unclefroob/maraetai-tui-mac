@@ -157,6 +157,7 @@ async fn run_play(
         String::new(), // format unknown — this command only has a raw song id, no library metadata
         false,
         song_id.clone(),
+        0.0, // no ReplayGain data available from a bare song id either
     );
     proxy
         .play_queue(vec![track], 0)

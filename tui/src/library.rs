@@ -40,13 +40,10 @@ pub struct Playlist {
     pub owner: String,
 }
 
-/// One entry of `getArtistInfo2`'s `similarArtist` list. `id` isn't used yet
-/// (the info screen only displays `name`) — kept because it's what a future
-/// "jump to this artist" action would need, and it's part of the real API
-/// shape either way.
+/// One entry of `getArtistInfo2`'s `similarArtist` list — `id` is what the
+/// Info screen's "jump to this artist" (`Enter`) actually navigates to.
 #[derive(Debug, Clone, Deserialize)]
 pub struct SimilarArtist {
-    #[allow(dead_code)]
     pub id: String,
     pub name: String,
 }
@@ -123,6 +120,18 @@ pub struct Genre {
     pub album_count: u32,
 }
 
+/// OpenSubsonic's `replayGain` object — `trackGain`/`albumGain` in
+/// decibels, relative to the format's reference loudness. Either or both
+/// may be absent (an older server, or a file with no embedded ReplayGain
+/// tags at all).
+#[derive(Debug, Clone, Deserialize)]
+pub struct ReplayGain {
+    #[serde(default, rename = "trackGain")]
+    pub track_gain: Option<f64>,
+    #[serde(default, rename = "albumGain")]
+    pub album_gain: Option<f64>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Song {
     pub id: String,
@@ -148,11 +157,25 @@ pub struct Song {
     /// presence matters here; the actual timestamp value is never shown.
     #[serde(default)]
     pub starred: Option<String>,
+    #[serde(default, rename = "replayGain")]
+    pub replay_gain: Option<ReplayGain>,
 }
 
 impl Song {
     pub fn is_starred(&self) -> bool {
         self.starred.is_some()
+    }
+
+    /// The gain (in dB) to apply for ReplayGain when this song plays —
+    /// track gain preferred over album gain (the standard "per-track
+    /// normalization" convention most players default to), or `0.0` (no
+    /// adjustment) if the server sent neither — most servers, and most
+    /// files with no embedded ReplayGain tags. A plain `f64` rather than
+    /// `Option<f64>`: the daemon's D-Bus control channel can't carry an
+    /// `Option` (see `daemon::control::QueueEntry`), and a genuine 0 dB
+    /// tag would mean the same "no adjustment" outcome anyway.
+    pub fn replay_gain_db(&self) -> f64 {
+        self.replay_gain.as_ref().and_then(|rg| rg.track_gain.or(rg.album_gain)).unwrap_or(0.0)
     }
 }
 
@@ -305,6 +328,14 @@ impl Client {
         let mut root = self
             .get_json("rest/getAlbumList2.view", &[("type", "alphabeticalByName"), ("size", "200")])
             .await?;
+        parse(root["albumList2"]["album"].take())
+    }
+
+    /// The same `getAlbumList2` endpoint as `albums()`, sorted by most
+    /// recently added instead of alphabetically — for the Albums tab's
+    /// sort toggle (`t`).
+    pub async fn newest_albums(&self) -> Result<Vec<Album>> {
+        let mut root = self.get_json("rest/getAlbumList2.view", &[("type", "newest"), ("size", "200")]).await?;
         parse(root["albumList2"]["album"].take())
     }
 
@@ -722,6 +753,27 @@ mod tests {
         assert!(!song.is_starred());
     }
 
+    #[test]
+    fn replay_gain_prefers_track_gain_over_album_gain() {
+        let song: Song = serde_json::from_str(
+            r#"{"id":"s1","title":"Angel","replayGain":{"trackGain":-6.5,"albumGain":-7.2}}"#,
+        )
+        .unwrap();
+        assert_eq!(song.replay_gain_db(), -6.5);
+    }
+
+    #[test]
+    fn replay_gain_falls_back_to_album_gain_when_track_gain_is_absent() {
+        let song: Song = serde_json::from_str(r#"{"id":"s1","title":"Angel","replayGain":{"albumGain":-7.2}}"#).unwrap();
+        assert_eq!(song.replay_gain_db(), -7.2);
+    }
+
+    #[test]
+    fn replay_gain_is_zero_without_the_field_at_all() {
+        let song: Song = serde_json::from_str(r#"{"id":"s1","title":"Angel"}"#).unwrap();
+        assert_eq!(song.replay_gain_db(), 0.0);
+    }
+
     /// Confirms `set_starred` hits the exact endpoints/params the Subsonic
     /// spec (and every other maraetai client) uses — `star`/`unstar` with an
     /// `id` query param — by capturing the real outgoing request rather than
@@ -849,6 +901,22 @@ mod tests {
     fn strip_html_removes_tags_and_unescapes_entities() {
         assert_eq!(strip_html("Tom &amp; Jerry <b>rock</b>"), "Tom & Jerry rock");
         assert_eq!(strip_html("  padded  "), "padded");
+    }
+
+    #[tokio::test]
+    async fn newest_albums_requests_the_newest_sort_type() {
+        let (url, request) = respond_once_capturing(
+            r#"{"subsonic-response":{"status":"ok","albumList2":{"album":[
+                {"id":"al3","name":"Blue Lines","artist":"Massive Attack"}
+            ]}}}"#,
+        )
+        .await;
+        let client = Client::new(test_creds(url));
+        let albums = client.newest_albums().await.unwrap();
+        assert_eq!(albums.len(), 1);
+        let request_line = request.await.unwrap();
+        assert!(request_line.starts_with("GET /rest/getAlbumList2.view?"), "got: {request_line}");
+        assert!(request_line.contains("type=newest"), "got: {request_line}");
     }
 
     #[tokio::test]
