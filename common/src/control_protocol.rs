@@ -52,6 +52,7 @@ pub enum Request {
     PlayQueue { tracks: Vec<QueueEntry>, start_index: u32 },
     PlayAt { index: u32 },
     AppendQueue { tracks: Vec<QueueEntry> },
+    PlayNext { tracks: Vec<QueueEntry> },
     Queue,
     RemoveFromQueue { index: u32 },
     MoveInQueue { from: u32, to: u32 },

@@ -73,6 +73,9 @@ impl ControlProxy<'_> {
     pub async fn append_queue(&self, tracks: Vec<QueueEntry>) -> Result<()> {
         self.call_unit(Request::AppendQueue { tracks }).await
     }
+    pub async fn play_next(&self, tracks: Vec<QueueEntry>) -> Result<()> {
+        self.call_unit(Request::PlayNext { tracks }).await
+    }
     pub async fn remove_from_queue(&self, index: u32) -> Result<()> {
         self.call_unit(Request::RemoveFromQueue { index }).await
     }

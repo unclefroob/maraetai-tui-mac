@@ -89,6 +89,10 @@ fn dispatch(request: Request, playback: &PlaybackHandle, shutdown: &Arc<Notify>)
             playback.append_queue(tracks.into_iter().map(track_meta_from_entry).collect());
             Response::Unit
         }
+        Request::PlayNext { tracks } => {
+            playback.play_next(tracks.into_iter().map(track_meta_from_entry).collect());
+            Response::Unit
+        }
         Request::Queue => {
             Response::Queue(playback.snapshot().queue.iter().map(queue_row_from_track).collect())
         }

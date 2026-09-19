@@ -258,6 +258,15 @@ pub enum Command {
     /// playback starts at the first appended track instead (otherwise
     /// "append" would silently do nothing audible).
     AppendQueue(Vec<TrackMeta>),
+    /// Inserts tracks to play immediately after the current one — distinct
+    /// from both `AppendQueue` (goes to the very end) and `PlayQueue`
+    /// (replaces the queue). If nothing is currently playing, behaves like
+    /// `AppendQueue` (starts playback at what was just added, since
+    /// "next" is meaningless with no "now"). Calling this again before the
+    /// first inserted batch plays inserts the new batch *ahead* of it —
+    /// the most recently requested "play next" always wins the front spot,
+    /// matching how most players' own "play next" behaves.
+    PlayNext(Vec<TrackMeta>),
     /// Removes one track from the queue by its current index — for the
     /// TUI's Queue view "remove selected" (`d`). Removing the
     /// currently-playing track skips to whatever now occupies that slot (or
@@ -360,6 +369,9 @@ impl PlaybackHandle {
     }
     pub fn append_queue(&self, tracks: Vec<TrackMeta>) {
         self.send(Command::AppendQueue(tracks));
+    }
+    pub fn play_next(&self, tracks: Vec<TrackMeta>) {
+        self.send(Command::PlayNext(tracks));
     }
     pub fn remove_from_queue(&self, index: usize) {
         self.send(Command::RemoveFromQueue(index));
@@ -605,6 +617,30 @@ fn run_engine(
                         start_playback_at(&mut state, &snapshot, &events, start_of_new);
                     } else {
                         snapshot.lock().expect("poisoned").queue_len = state.queue.len();
+                    }
+                }
+            }
+            Ok(Command::PlayNext(tracks)) => {
+                if !tracks.is_empty() {
+                    let n = tracks.len();
+                    if state.sink.is_none() {
+                        // Nothing was playing — "next" is meaningless with
+                        // no "now", so this behaves exactly like
+                        // AppendQueue: start at what was just added.
+                        let start_of_new = state.queue.len();
+                        state.queue.extend(tracks);
+                        state.play_order.extend(start_of_new..state.queue.len());
+                        snapshot.lock().expect("poisoned").queue = state.queue.clone();
+                        start_playback_at(&mut state, &snapshot, &events, start_of_new);
+                    } else {
+                        let (new_order, insert_at) = play_next_insertion(&state.play_order, state.order_pos, state.index, n);
+                        for (offset, track) in tracks.into_iter().enumerate() {
+                            state.queue.insert(insert_at + offset, track);
+                        }
+                        state.play_order = new_order;
+                        let mut snap = snapshot.lock().expect("poisoned");
+                        snap.queue = state.queue.clone();
+                        snap.queue_len = state.queue.len();
                     }
                 }
             }
@@ -861,6 +897,36 @@ fn remap_index_after_move(i: usize, from: usize, to: usize) -> usize {
 /// `play_order_after_remove`.
 fn play_order_after_move(order: &[usize], from: usize, to: usize) -> Vec<usize> {
     order.iter().map(|&i| remap_index_after_move(i, from, to)).collect()
+}
+
+/// Recomputes `play_order` after inserting `count` new tracks into the
+/// queue at `insert_at` — every existing entry pointing at `insert_at` or
+/// later shifts up by `count` to keep pointing at the same track (mirrors
+/// a plain `Vec::insert` on the queue itself). The new tracks' own
+/// indices still need adding to the order separately, at wherever they
+/// should actually play — see `Command::PlayNext`'s handler, which always
+/// splices them in right after the current position, not at the end.
+fn play_order_after_insert(order: &[usize], insert_at: usize, count: usize) -> Vec<usize> {
+    order.iter().map(|&i| if i >= insert_at { i + count } else { i }).collect()
+}
+
+/// The full queue/play-order math behind `Command::PlayNext`'s "something
+/// is already playing" branch — factored out (rather than inlined in the
+/// command handler) so this splicing, easy to get subtly wrong, is
+/// unit-testable without a live `EngineState` (which owns a real audio
+/// output stream, not something to open in a test). Returns the new
+/// `play_order` and the queue index the new tracks should be inserted at.
+fn play_next_insertion(play_order: &[usize], order_pos: usize, current_index: usize, count: usize) -> (Vec<usize>, usize) {
+    let insert_at = current_index + 1;
+    let mut new_order = play_order_after_insert(play_order, insert_at, count);
+    // Spliced in right after the current position (not appended to the
+    // order's end), so the new tracks are genuinely *next* regardless of
+    // shuffle — and ahead of any earlier "play next" batch still waiting
+    // there, matching most players' "most recent request wins the front
+    // spot".
+    let new_indices: Vec<usize> = (insert_at..insert_at + count).collect();
+    new_order.splice(order_pos + 1..order_pos + 1, new_indices);
+    (new_order, insert_at)
 }
 
 /// Starts playing `state.queue[index]`, replacing whatever was playing.
@@ -1210,6 +1276,59 @@ mod tests {
         let mut sorted = order.clone();
         sorted.sort_unstable();
         assert_eq!(sorted, vec![0, 1, 2, 3, 4], "moving must never drop or duplicate an index: {order:?}");
+    }
+
+    #[test]
+    fn play_order_after_insert_shifts_indices_at_or_past_the_insertion_point() {
+        // Inserting 2 new tracks at queue position 2: existing entries
+        // pointing at 2 or later move up by 2 to keep pointing at the same
+        // track; anything before 2 is untouched.
+        assert_eq!(play_order_after_insert(&[0, 1, 2, 3], 2, 2), vec![0, 1, 4, 5]);
+    }
+
+    #[test]
+    fn play_order_after_insert_with_nothing_at_or_past_the_point_is_unchanged() {
+        assert_eq!(play_order_after_insert(&[0, 1], 2, 3), vec![0, 1]);
+    }
+
+    #[test]
+    fn play_next_insertion_lands_immediately_after_the_current_position_even_when_shuffled() {
+        // A shuffled 4-track queue, currently playing queue index 3 (the
+        // 2nd entry in this play order). "Play next" 2 new tracks: they
+        // must land at order_pos + 1 (right after 3, i.e. queue positions
+        // 4 and 5, since len was 4), not appended to the order's tail —
+        // and everything queue index >= 4 already in the order (there is
+        // none here, since 4/5 don't exist yet) would shift if it did.
+        let order = vec![1, 3, 0, 2];
+        let (new_order, insert_at) = play_next_insertion(&order, 1, 3, 2);
+        assert_eq!(insert_at, 4);
+        assert_eq!(new_order, vec![1, 3, 4, 5, 0, 2], "new tracks must appear right after the current position");
+    }
+
+    #[test]
+    fn play_next_insertion_shifts_existing_entries_that_already_pointed_past_the_insert() {
+        // Playing queue index 0 (order_pos 0); inserting 1 track after it.
+        // The existing entry pointing at queue index 1 must shift to 2 to
+        // keep pointing at the same (now-shifted) track.
+        let order = vec![0, 1];
+        let (new_order, insert_at) = play_next_insertion(&order, 0, 0, 1);
+        assert_eq!(insert_at, 1);
+        assert_eq!(new_order, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn play_next_insertion_calling_twice_puts_the_second_batch_ahead_of_the_first() {
+        // Playing queue index 0. First "play next" inserts 1 track (queue
+        // index 1) right after it. Before that plays, a second "play
+        // next" of 1 more track must land ahead of the first — LIFO, the
+        // most recently requested "next" wins the front spot.
+        let order = vec![0];
+        let (after_first, _) = play_next_insertion(&order, 0, 0, 1);
+        assert_eq!(after_first, vec![0, 1]);
+        let (after_second, _) = play_next_insertion(&after_first, 0, 0, 1);
+        // The new track (queue index 1, since it's inserted at index+1=1
+        // again) pushes the first batch's track to queue index 2.
+        assert_eq!(after_second, vec![0, 1, 2]);
     }
 
     /// Verifies `spawn_scrobble` against `maraetai-service`'s actual

@@ -669,6 +669,9 @@ impl App<'_> {
                     }
                 }
                 KeyCode::Char('a') => self.append_selection().await,
+                // Play next: inserts right after the current track,
+                // rather than at the end of the queue like `a`.
+                KeyCode::Char('A') => self.play_next_selection().await,
                 KeyCode::Char('f') => self.toggle_star().await,
                 // Marks/unmarks the selected song for a bulk action — see
                 // `toggle_mark` and `marked_songs`.
@@ -1676,6 +1679,52 @@ impl App<'_> {
         }
     }
 
+    /// `A`: inserts the selected song(s) to play immediately after the
+    /// current track — for `Command::PlayNext`, distinct from `a` ("add to
+    /// queue", which goes to the very end). Unlike `a`, this is always
+    /// just the song(s) actually selected/marked, never "and the rest of
+    /// the list": "play next" means "play this next," not "replace
+    /// everything after the current track with the rest of this list."
+    async fn play_next_selection(&mut self) {
+        if let Some(songs) = self.marked_songs() {
+            self.play_next(songs).await;
+            self.clear_marks();
+            return;
+        }
+        if let Screen::Home { sections, section, selected } = self.top() {
+            let song = sections.get(*section).and_then(|s| s.songs.get(*selected)).cloned();
+            if let Some(song) = song {
+                self.play_next(vec![song]).await;
+            }
+            return;
+        }
+        let visible = self.visible_indices();
+        let song = match self.top() {
+            Screen::SongList { songs, selected, .. } => visible.get(*selected).and_then(|&i| songs.get(i)).cloned(),
+            Screen::Search { results, selected, editing, .. } if !*editing => {
+                visible.get(*selected).and_then(|&i| results.get(i)).cloned()
+            }
+            _ => None,
+        };
+        let Some(song) = song else { return };
+        self.play_next(vec![song]).await;
+    }
+
+    async fn play_next(&mut self, songs: Vec<Song>) {
+        let tracks = self.build_queue_entries(&songs);
+        let count = tracks.len();
+        match self.proxy.play_next(tracks).await {
+            Ok(()) => {
+                self.message = if count == 1 {
+                    "will play next".to_string()
+                } else {
+                    format!("will play next: {count} tracks")
+                }
+            }
+            Err(e) => self.message = format!("could not queue: {e}"),
+        }
+    }
+
     async fn append_selection(&mut self) {
         if let Some(songs) = self.marked_songs() {
             self.append_from(songs, 0).await;
@@ -1960,9 +2009,12 @@ impl App<'_> {
                 });
                 let delete_hint = if playlist_id.is_some() { "  [d]elete" } else { "" };
                 let hint = if marked.is_empty() {
-                    format!("[Enter] play  [v] mark  [a]dd  [f]avorite  [P]laylist{delete_hint}  [Esc] back")
+                    format!("[Enter] play  [v] mark  [a]dd  [A] next  [f]avorite  [P]laylist{delete_hint}  [Esc] back")
                 } else {
-                    format!("{} marked — [Enter] play all  [v] unmark  [a]dd all  [f]avorite all  [P]laylist all{delete_hint}  [Esc] back", marked.len())
+                    format!(
+                        "{} marked — [Enter] play all  [v] unmark  [a]dd all  [A] next  [f]avorite all  [P]laylist all{delete_hint}  [Esc] back",
+                        marked.len()
+                    )
                 };
                 let title = filter_hint_title(title, filter, self.filter_editing, &hint);
                 self.draw_song_table(frame, chunks[1], &title, rows, *selected, &now_playing.title);
@@ -1992,9 +2044,12 @@ impl App<'_> {
                 let title = if *editing {
                     format!(" Search: {query}_  [Enter] run  [Esc] stop editing ")
                 } else if marked.is_empty() {
-                    format!(" Search: {query}  [Enter] play  [v] mark  [a]dd  [f]avorite  [P]laylist  [/] new search ")
+                    format!(" Search: {query}  [Enter] play  [v] mark  [a]dd  [A] next  [f]avorite  [P]laylist  [/] new search ")
                 } else {
-                    format!(" Search: {query}  {} marked — [Enter] play all  [v] unmark  [a]dd all  [f]avorite all  [P]laylist all  [/] new search ", marked.len())
+                    format!(
+                        " Search: {query}  {} marked — [Enter] play all  [v] unmark  [a]dd all  [A] next  [f]avorite all  [P]laylist all  [/] new search ",
+                        marked.len()
+                    )
                 };
                 let rows = results.iter().map(|s| {
                     let (fmt, lossless) = library::format_label(&s.suffix, s.bit_rate);
@@ -2038,6 +2093,7 @@ impl App<'_> {
             ("Up/k Down/j", "move selection"),
             ("Enter", "open / play from here"),
             ("a", "add to queue (don't replace it)"),
+            ("A", "play next (right after the current track)"),
             ("f", "toggle favorite on the selected song(s)"),
             ("v", "mark/unmark for a bulk action (Enter/a/f/P/d act on all marked)"),
             ("e", "expand a Home section into its full list"),
@@ -2198,7 +2254,7 @@ impl App<'_> {
 
         for (i, sec) in sections.iter().enumerate() {
             let focused = i == section;
-            let title = format!(" {} — [Enter] play  [e]xpand  [a]dd  [f]avorite ", sec.kind.title());
+            let title = format!(" {} — [Enter] play  [e]xpand  [a]dd  [A] next  [f]avorite ", sec.kind.title());
             if sec.songs.is_empty() {
                 let block = rounded_block(title);
                 let inner = block.inner(chunks[i]);

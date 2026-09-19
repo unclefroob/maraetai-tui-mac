@@ -61,6 +61,14 @@ impl ControlInterface {
         self.playback.append_queue(tracks);
     }
 
+    /// Inserts tracks to play immediately after the current one —
+    /// distinct from `append_queue` (goes to the very end) and
+    /// `play_queue` (replaces the queue) — for the `A` ("play next") key.
+    async fn play_next(&self, tracks: Vec<QueueEntry>) {
+        let tracks = tracks.into_iter().map(track_meta_from_entry).collect();
+        self.playback.play_next(tracks);
+    }
+
     /// The full current queue, in order — for a TUI "Queue" view. Not a
     /// property (like MPRIS's `Metadata`) since it's a list, not a single
     /// value, and this project doesn't implement MPRIS's TrackList

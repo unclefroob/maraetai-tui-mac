@@ -21,6 +21,9 @@ pub trait Control {
     /// Adds tracks to the end of the queue without interrupting playback —
     /// distinct from `play_queue`, which always replaces the queue.
     async fn append_queue(&self, tracks: Vec<QueueEntry>) -> zbus::Result<()>;
+    /// Inserts tracks to play immediately after the current one — distinct
+    /// from `append_queue` (end of queue) and `play_queue` (replaces it).
+    async fn play_next(&self, tracks: Vec<QueueEntry>) -> zbus::Result<()>;
     /// Removes one track from the queue by its current position.
     async fn remove_from_queue(&self, index: u32) -> zbus::Result<()>;
     /// Moves the track at `from` to position `to`, shifting everything
