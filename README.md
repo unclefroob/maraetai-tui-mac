@@ -112,7 +112,7 @@ daemon already running in memory.
 
 Full reference is always available in-app via `?`. Highlights:
 
-**Navigation** — `1`-`7` / `[`/`]` switch tabs, `Up`/`k` `Down`/`j` move,
+**Navigation** — `1`-`8` / `[`/`]` switch tabs, `Up`/`k` `Down`/`j` move,
 `Enter` open/play, `Esc`/`Backspace` back, `/` filter the current list.
 
 **Playback** — `space` play/pause, `n`/`p` next/previous, `Left`/`Right`
@@ -132,6 +132,18 @@ toggle Albums sort (A-Z / newest), `e` expand a Home section, `i` artist
 bio/similar artists or album notes, `l` toggle the lyrics panel.
 
 **Other** — `q` quit (daemon keeps running), `Q` quit and stop it.
+
+## Settings tab & updating from within the TUI
+
+The Settings tab (`8`) shows the commit this binary was built from and
+lets you check GitHub for a newer one: `c` checks, and if an update is
+available, `u` twice (a "press again to confirm" gate, since it's a real
+action) reinstalls both binaries with `cargo install --git ... --force` —
+this works even if you no longer have a local checkout, unlike `cargo
+install --path`, which keeps no link back to any repository once
+installed. You'll still need to restart the daemon and the TUI afterward
+for the new build to actually take over — reinstalling the binary doesn't
+touch an already-running process, same as any other update.
 
 ## Out of scope (for now)
 
