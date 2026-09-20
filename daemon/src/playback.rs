@@ -14,7 +14,7 @@
 //! which defeats a core point of building MPRIS support in the first place.
 
 use std::io::{Read, Seek, SeekFrom};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -556,6 +556,12 @@ struct EngineState {
     /// inherit whatever the *previous* sink's volume was, and needs this
     /// re-applied (combined with `replay_gain_scale`) every time.
     volume: f32,
+    /// The actual combined factor (`volume * replay_gain_scale`) every
+    /// track's `VolumeControl` reads from — one shared cell across the
+    /// engine's whole lifetime (not recreated per track) so `Command::
+    /// SetVolume` can update it with zero lag regardless of which track is
+    /// currently playing.
+    volume_factor: Arc<AtomicU32>,
 }
 
 fn run_engine(
@@ -590,6 +596,7 @@ fn run_engine(
         current: None,
         credentials,
         volume: 1.0,
+        volume_factor: Arc::new(AtomicU32::new(1.0f32.to_bits())),
     };
 
     loop {
@@ -798,10 +805,14 @@ fn run_engine(
             }
             Ok(Command::SetVolume(v)) => {
                 state.volume = v;
-                if let Some(sink) = &state.sink {
-                    let gain = state.current.as_ref().map(|t| t.replay_gain_db).unwrap_or(0.0);
-                    sink.set_volume(v * replay_gain_scale(gain));
-                }
+                // Updates `VolumeControl`'s factor directly — takes effect
+                // on the very next sample, not delayed by rodio's own
+                // `Sink::set_volume` (see `VolumeControl`'s doc comment).
+                // Unconditional (no `if let Some(sink)` guard): harmless
+                // with nothing playing yet, and correctly primes the value
+                // the next track's `start_playback_at` will pick up.
+                let gain = state.current.as_ref().map(|t| t.replay_gain_db).unwrap_or(0.0);
+                state.volume_factor.store((v * replay_gain_scale(gain)).to_bits(), Ordering::Relaxed);
                 snapshot.lock().expect("poisoned").volume = v;
             }
             Ok(Command::CycleRepeat) => {
@@ -929,6 +940,59 @@ fn play_next_insertion(play_order: &[usize], order_pos: usize, current_index: us
     (new_order, insert_at)
 }
 
+/// Applies a volume factor directly to the sample stream, read fresh from a
+/// shared atomic on every single sample — unlike `Sink::set_volume`, whose
+/// real effect is delayed by rodio's own internal ~5ms periodic-access poll
+/// (every fresh `Sink` starts its wrapped source at a hardcoded 1.0 factor;
+/// whatever `set_volume` was actually called with only reaches the amplifier
+/// on the next poll tick). That's an inaudibly short window in practice, but
+/// a genuinely avoidable one: this wrapper's factor is already correct on
+/// the very first sample of every track, and updates with zero lag whenever
+/// the engine changes it (`EngineState::volume_factor`), rather than only
+/// eventually.
+struct VolumeControl<S> {
+    inner: S,
+    factor: Arc<AtomicU32>,
+}
+
+impl<S> VolumeControl<S> {
+    fn new(inner: S, factor: Arc<AtomicU32>) -> Self {
+        Self { inner, factor }
+    }
+}
+
+impl<S: Iterator<Item = f32>> Iterator for VolumeControl<S> {
+    type Item = f32;
+    fn next(&mut self) -> Option<f32> {
+        let sample = self.inner.next()?;
+        Some(sample * f32::from_bits(self.factor.load(Ordering::Relaxed)))
+    }
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.inner.size_hint()
+    }
+}
+
+impl<S: Source<Item = f32>> Source for VolumeControl<S> {
+    fn current_span_len(&self) -> Option<usize> {
+        self.inner.current_span_len()
+    }
+    fn channels(&self) -> u16 {
+        self.inner.channels()
+    }
+    fn sample_rate(&self) -> u32 {
+        self.inner.sample_rate()
+    }
+    fn total_duration(&self) -> Option<Duration> {
+        self.inner.total_duration()
+    }
+    // Without this override, seeking would silently stop working the same
+    // way it originally did for `VisualizerTap` — `Sink::try_seek` only
+    // ever sees the outermost wrapping source.
+    fn try_seek(&mut self, pos: Duration) -> Result<(), rodio::source::SeekError> {
+        self.inner.try_seek(pos)
+    }
+}
+
 /// Starts playing `state.queue[index]`, replacing whatever was playing.
 fn start_playback_at(
     state: &mut EngineState,
@@ -990,13 +1054,16 @@ fn start_playback_at(
     state.current_format = Some((decoder.channels(), decoder.sample_rate()));
     state.analyzer.reset();
     let tapped = VisualizerTap::new(decoder, Arc::clone(&state.sample_ring));
+    // Primed before the source is ever appended, so the very first sample
+    // of this track already carries the correct combined volume — the
+    // user's own setting times this track's ReplayGain scale (see
+    // `VolumeControl`'s doc comment for why this isn't just
+    // `sink.set_volume`).
+    state.volume_factor.store((state.volume * replay_gain_scale(meta.replay_gain_db)).to_bits(), Ordering::Relaxed);
+    let volume_controlled = VolumeControl::new(tapped, Arc::clone(&state.volume_factor));
 
     let sink = Sink::connect_new(state.stream.mixer());
-    sink.append(tapped);
-    // A fresh sink doesn't inherit the previous one's volume — re-apply
-    // the user's own setting, combined with this track's ReplayGain scale
-    // (see `replay_gain_scale`).
-    sink.set_volume(state.volume * replay_gain_scale(meta.replay_gain_db));
+    sink.append(volume_controlled);
     {
         let mut snap = snapshot.lock().expect("poisoned");
         snap.status = Status::Playing;
@@ -1129,6 +1196,25 @@ mod tests {
     use std::sync::mpsc as std_mpsc;
 
     use super::*;
+
+    #[test]
+    fn volume_control_applies_the_current_factor_to_each_sample() {
+        let factor = Arc::new(AtomicU32::new(1.0f32.to_bits()));
+        let mut vc = VolumeControl::new(vec![1.0f32, 1.0, 1.0].into_iter(), Arc::clone(&factor));
+        assert_eq!(vc.next(), Some(1.0));
+        factor.store(0.5f32.to_bits(), Ordering::Relaxed);
+        // Takes effect on the very next sample — no delay, unlike rodio's
+        // own `Sink::set_volume` (see the doc comment on `VolumeControl`).
+        assert_eq!(vc.next(), Some(0.5));
+        assert_eq!(vc.next(), Some(0.5));
+    }
+
+    #[test]
+    fn volume_control_forwards_exhaustion() {
+        let factor = Arc::new(AtomicU32::new(1.0f32.to_bits()));
+        let mut vc = VolumeControl::new(std::iter::empty::<f32>(), factor);
+        assert_eq!(vc.next(), None);
+    }
 
     #[test]
     fn replay_gain_scale_of_zero_db_is_unity() {
