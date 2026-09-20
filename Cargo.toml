@@ -8,7 +8,7 @@ edition = "2021"
 license = "MIT"
 
 [workspace.dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "signal", "fs", "io-util"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "signal", "fs", "io-util", "process"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

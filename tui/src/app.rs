@@ -514,6 +514,21 @@ fn fmt_time(secs: f64) -> String {
     format!("{}:{:02}", secs / 60, secs % 60)
 }
 
+fn play_next_message(songs: &[Song]) -> String {
+    let Some(first) = songs.first() else {
+        return "nothing queued".to_string();
+    };
+    let mut message = format!("up next: {}", first.title);
+    if !first.artist.is_empty() {
+        message.push_str(" — ");
+        message.push_str(&first.artist);
+    }
+    if songs.len() > 1 {
+        message.push_str(&format!(" (+{} more)", songs.len() - 1));
+    }
+    message
+}
+
 /// The first 12 characters of a commit sha — matches the length
 /// `update_check::BUILT_FROM_HASH` is embedded at, so the two are visually
 /// comparable at a glance. `char_indices` rather than a byte slice since a
@@ -1879,16 +1894,10 @@ impl App<'_> {
     }
 
     async fn play_next(&mut self, songs: Vec<Song>) {
+        let success_message = play_next_message(&songs);
         let tracks = self.build_queue_entries(&songs);
-        let count = tracks.len();
         match self.proxy.play_next(tracks).await {
-            Ok(()) => {
-                self.message = if count == 1 {
-                    "will play next".to_string()
-                } else {
-                    format!("will play next: {count} tracks")
-                }
-            }
+            Ok(()) => self.message = success_message,
             Err(e) => self.message = format!("could not queue: {e}"),
         }
     }
@@ -2841,6 +2850,25 @@ mod tests {
             .zip(kinds)
             .map(|(&n, kind)| HomeSection { kind, songs: (0..n).map(|i| test_song(&i.to_string())).collect() })
             .collect()
+    }
+
+    #[test]
+    fn play_next_message_names_the_selected_song() {
+        let mut song = test_song("song-1");
+        song.title = "Teardrop".into();
+        song.artist = "Massive Attack".into();
+        assert_eq!(play_next_message(&[song]), "up next: Teardrop — Massive Attack");
+    }
+
+    #[test]
+    fn play_next_message_summarizes_a_marked_selection() {
+        let mut first = test_song("song-1");
+        first.title = "Teardrop".into();
+        first.artist = "Massive Attack".into();
+        assert_eq!(
+            play_next_message(&[first, test_song("song-2"), test_song("song-3")]),
+            "up next: Teardrop — Massive Attack (+2 more)"
+        );
     }
 
     #[test]
