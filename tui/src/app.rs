@@ -43,6 +43,7 @@ use crate::dbus_client::{ControlProxy, QueueEntry};
 #[cfg(target_os = "macos")]
 use crate::socket_client::{ControlProxy, QueueEntry};
 use crate::library::{self, Album, Artist, Genre, Playlist, Song};
+use crate::update_check;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
 const SEEK_STEP: f64 = 5.0;
@@ -70,17 +71,18 @@ enum Tab {
     Genres,
     Search,
     Queue,
+    Settings,
 }
 
 /// Digits `1`-`9` jump directly to a tab; `[`/`]` cycle through all of them.
-/// With exactly 7 tabs every one of them already has a digit of its own —
+/// With exactly 8 tabs every one of them already has a digit of its own —
 /// `[`/`]` are just a nice-to-have alternative, not load-bearing the way
 /// they were when there were more tabs than digits. Lyrics used to be one
 /// of these tabs; it's now a toggleable panel instead (see `App::lyrics_open`)
 /// since it only ever makes sense while something is playing, unlike every
 /// tab here which is always browsable.
-const TABS: [Tab; 7] =
-    [Tab::Home, Tab::Playlists, Tab::Albums, Tab::Artists, Tab::Genres, Tab::Search, Tab::Queue];
+const TABS: [Tab; 8] =
+    [Tab::Home, Tab::Playlists, Tab::Albums, Tab::Artists, Tab::Genres, Tab::Search, Tab::Queue, Tab::Settings];
 
 impl Tab {
     fn label(self) -> &'static str {
@@ -92,6 +94,7 @@ impl Tab {
             Tab::Genres => "Genres",
             Tab::Search => "Search",
             Tab::Queue => "Queue",
+            Tab::Settings => "Settings",
         }
     }
 }
@@ -310,6 +313,36 @@ enum Screen {
         similar_artists: Vec<library::SimilarArtist>,
         similar_selected: usize,
     },
+    /// Build info + the update checker (`c`/`u`) — see `App::update_state`,
+    /// which actually owns the check/apply state (kept on `App` rather than
+    /// here, so it survives navigating away and back, and so a slow
+    /// `apply_update` in flight isn't lost by switching tabs).
+    Settings,
+}
+
+/// Where the update checker (Settings tab) currently is — see
+/// `update_check`. Lives on `App`, not `Screen::Settings`, specifically so
+/// switching tabs away and back doesn't lose an in-flight check or apply.
+enum UpdateState {
+    Idle,
+    Checking,
+    UpToDate,
+    Available(update_check::RemoteCommit),
+    /// `u` on `Available` moves here; `u` again from here actually applies
+    /// — a lightweight "press again to confirm" gate on an action that
+    /// reinstalls both binaries, rather than a single keypress doing it.
+    ConfirmApply(update_check::RemoteCommit),
+    Applying,
+    Applied,
+    Failed(String),
+}
+
+/// One check/apply's result, delivered back from the background task that
+/// ran it — see `App::update_tx`/`update_rx`, same pattern as `art_tx`/
+/// `lyrics_tx`.
+enum UpdateEvent {
+    CheckDone(Result<update_check::CheckResult, String>),
+    ApplyDone(Result<(), String>),
 }
 
 /// A point-in-time playback status snapshot, as returned by `Status()`.
@@ -398,6 +431,12 @@ struct App<'a> {
     /// it. One shared field rather than one per action, since only one
     /// prompt can ever be open at a time.
     prompt: Option<TextPrompt>,
+    /// The update checker's current state (Settings tab) — see
+    /// `UpdateState`'s doc comment for why this lives here and not on
+    /// `Screen::Settings`.
+    update_state: UpdateState,
+    update_tx: mpsc::UnboundedSender<UpdateEvent>,
+    update_rx: mpsc::UnboundedReceiver<UpdateEvent>,
 }
 
 /// What a submitted `TextPrompt` actually does — see `App::submit_prompt`.
@@ -427,6 +466,7 @@ struct LyricsFetched {
 pub async fn run(proxy: ControlProxy<'_>, creds: maraetai_common::Credentials) -> Result<()> {
     let (art_tx, art_rx) = mpsc::unbounded_channel();
     let (lyrics_tx, lyrics_rx) = mpsc::unbounded_channel();
+    let (update_tx, update_rx) = mpsc::unbounded_channel();
     let mut terminal = ratatui::init();
     let picker = art::make_picker();
     let mut app = App {
@@ -448,6 +488,9 @@ pub async fn run(proxy: ControlProxy<'_>, creds: maraetai_common::Credentials) -
         filter_editing: false,
         show_help: false,
         prompt: None,
+        update_state: UpdateState::Idle,
+        update_tx,
+        update_rx,
     };
 
     app.switch_tab(Tab::Home, &mut terminal).await;
@@ -459,6 +502,17 @@ pub async fn run(proxy: ControlProxy<'_>, creds: maraetai_common::Credentials) -
 fn fmt_time(secs: f64) -> String {
     let secs = secs.max(0.0) as u64;
     format!("{}:{:02}", secs / 60, secs % 60)
+}
+
+/// The first 12 characters of a commit sha — matches the length
+/// `update_check::BUILT_FROM_HASH` is embedded at, so the two are visually
+/// comparable at a glance. `char_indices` rather than a byte slice since a
+/// hex sha is ASCII either way, but this stays correct even if it weren't.
+fn short_sha(sha: &str) -> &str {
+    match sha.char_indices().nth(12) {
+        Some((byte_index, _)) => &sha[..byte_index],
+        None => sha,
+    }
 }
 
 /// Builds a list/table title showing the active filter, if any, alongside
@@ -548,6 +602,7 @@ impl App<'_> {
             let now_playing = self.fetch_status().await;
             self.update_art(&now_playing);
             self.update_lyrics(&now_playing);
+            self.poll_update_events();
             terminal.draw(|frame| self.draw(frame, &now_playing))?;
 
             if !event::poll(POLL_INTERVAL)? {
@@ -691,8 +746,18 @@ impl App<'_> {
                 KeyCode::Char('P') => self.open_playlist_picker(terminal).await,
                 // New playlist (Playlists tab only).
                 KeyCode::Char('N') => self.prompt_new_playlist(),
-                // Rename the selected playlist (Playlists tab only).
-                KeyCode::Char('c') => self.prompt_rename_playlist(),
+                // Rename the selected playlist (Playlists tab only) — or,
+                // on the Settings tab, check for an update.
+                KeyCode::Char('c') => {
+                    if matches!(self.top(), Screen::Settings) {
+                        self.check_for_update();
+                    } else {
+                        self.prompt_rename_playlist();
+                    }
+                }
+                // Settings tab only: apply an update once one's available
+                // (first press confirms, second press actually installs).
+                KeyCode::Char('u') => self.request_apply_update(),
                 // Context-sensitive delete: a playlist itself
                 // (PlaylistList), a song within one (a playlist's
                 // SongList), or a track from the queue (Queue) — see
@@ -714,6 +779,13 @@ impl App<'_> {
                 KeyCode::Down | KeyCode::Char('j') => self.move_selection(1),
                 KeyCode::Enter => self.activate_selection(terminal).await,
                 KeyCode::Esc | KeyCode::Backspace => {
+                    // A pending "press u again to confirm" backs out first,
+                    // same "clear the in-progress thing before popping the
+                    // stack" precedent as a filter below.
+                    if let UpdateState::ConfirmApply(commit) = &self.update_state {
+                        self.update_state = UpdateState::Available(commit.clone());
+                        continue;
+                    }
                     // An active filter is cleared first (like most apps'
                     // "clear search, then go back"); only pop the stack
                     // once there's nothing left to clear.
@@ -859,6 +931,65 @@ impl App<'_> {
         }
     }
 
+    /// Drains completed check/apply results into `self.update_state` — same
+    /// pattern as `update_art`/`update_lyrics`. Unconditional (not gated on
+    /// the Settings tab being active): a slow `apply_update` must still
+    /// land its result even if the user switched away while it ran.
+    fn poll_update_events(&mut self) {
+        while let Ok(event) = self.update_rx.try_recv() {
+            self.update_state = match event {
+                UpdateEvent::CheckDone(Ok(result)) => {
+                    if result.update_available {
+                        UpdateState::Available(result.remote)
+                    } else {
+                        UpdateState::UpToDate
+                    }
+                }
+                UpdateEvent::CheckDone(Err(e)) => UpdateState::Failed(e),
+                UpdateEvent::ApplyDone(Ok(())) => UpdateState::Applied,
+                UpdateEvent::ApplyDone(Err(e)) => UpdateState::Failed(e),
+            };
+        }
+    }
+
+    /// `c` on the Settings tab: kicks off a background check, ignored if
+    /// one (or an apply) is already in flight.
+    fn check_for_update(&mut self) {
+        if !matches!(self.top(), Screen::Settings) {
+            return;
+        }
+        if matches!(self.update_state, UpdateState::Checking | UpdateState::Applying) {
+            return;
+        }
+        self.update_state = UpdateState::Checking;
+        let tx = self.update_tx.clone();
+        tokio::spawn(async move {
+            let result = update_check::check_for_update().await.map_err(|e| e.to_string());
+            let _ = tx.send(UpdateEvent::CheckDone(result));
+        });
+    }
+
+    /// `u` on the Settings tab: the first press moves `Available` to
+    /// `ConfirmApply` (see its doc comment); the second press from there
+    /// actually kicks off the background install. A no-op in any other
+    /// state (nothing to confirm, or already applying).
+    fn request_apply_update(&mut self) {
+        match &self.update_state {
+            UpdateState::Available(commit) => {
+                self.update_state = UpdateState::ConfirmApply(commit.clone());
+            }
+            UpdateState::ConfirmApply(_) => {
+                self.update_state = UpdateState::Applying;
+                let tx = self.update_tx.clone();
+                tokio::spawn(async move {
+                    let result = update_check::apply_update().await.map_err(|e| e.to_string());
+                    let _ = tx.send(UpdateEvent::ApplyDone(result));
+                });
+            }
+            _ => {}
+        }
+    }
+
     /// Switches the active tab, replacing the drill-down stack with that
     /// tab's freshly-fetched root screen. A fetch failure still leaves a
     /// (empty) screen in place — `self.message` carries the error — rather
@@ -957,6 +1088,11 @@ impl App<'_> {
                         self.stack.push(Screen::Queue { tracks: Vec::new(), selected: 0, filter: String::new() });
                     }
                 }
+            }
+            // No fetch here — the update-check state lives on `App`
+            // (`update_state`), not something this tab needs to load.
+            Tab::Settings => {
+                self.stack.push(Screen::Settings);
             }
         }
     }
@@ -1144,8 +1280,9 @@ impl App<'_> {
             Screen::Search { results, .. } => (0..results.len()).collect(),
             // Home has its own dedicated cursor/navigation instead (see
             // `home_move_selection`); the picker and info screens have
-            // their own equally simple movement (see `move_selection`).
-            Screen::Home { .. } | Screen::PlaylistPicker { .. } | Screen::Info { .. } => Vec::new(),
+            // their own equally simple movement (see `move_selection`);
+            // Settings has no list at all.
+            Screen::Home { .. } | Screen::PlaylistPicker { .. } | Screen::Info { .. } | Screen::Settings => Vec::new(),
         }
     }
 
@@ -1313,9 +1450,13 @@ impl App<'_> {
                 }
             }
             // Handled above (Search's own indexing; Home plays from its
-            // capped preview; PlaylistPicker adds and pops). Info has
-            // nothing to activate.
-            Screen::Search { .. } | Screen::Home { .. } | Screen::PlaylistPicker { .. } | Screen::Info { .. } => {}
+            // capped preview; PlaylistPicker adds and pops). Info and
+            // Settings have nothing for Enter to activate.
+            Screen::Search { .. }
+            | Screen::Home { .. }
+            | Screen::PlaylistPicker { .. }
+            | Screen::Info { .. }
+            | Screen::Settings => {}
         }
     }
 
@@ -2076,6 +2217,7 @@ impl App<'_> {
             Screen::Info { title, body, scroll, similar_artists, similar_selected } => {
                 self.draw_info(frame, chunks[1], title, body, *scroll, similar_artists, *similar_selected);
             }
+            Screen::Settings => self.draw_settings(frame, chunks[1]),
         }
 
         if show_lyrics {
@@ -2089,7 +2231,7 @@ impl App<'_> {
     /// closed by any key.
     fn draw_help(&self, frame: &mut Frame, area: Rect) {
         const BINDINGS: &[(&str, &str)] = &[
-            ("1-7  [ ]", "switch / cycle tabs"),
+            ("1-8  [ ]", "switch / cycle tabs"),
             ("Up/k Down/j", "move selection"),
             ("Enter", "open / play from here"),
             ("a", "add to queue (don't replace it)"),
@@ -2102,7 +2244,8 @@ impl App<'_> {
             ("i", "artist bio / album notes (Artists, Albums)"),
             ("P", "add the selected song to a playlist"),
             ("N", "new playlist (Playlists)"),
-            ("c", "rename the selected playlist (Playlists)"),
+            ("c", "rename the selected playlist (Playlists); check for updates (Settings)"),
+            ("u", "install an available update (Settings)"),
             ("d", "delete: a playlist, a song in one, or a queue track"),
             ("D", "clear the entire queue (Queue)"),
             ("J / K", "move the selected queue track down / up (Queue)"),
@@ -2329,6 +2472,55 @@ impl App<'_> {
             })
             .collect();
         frame.render_widget(List::new(items).block(rounded_block(" Similar artists ")), chunks[1]);
+    }
+
+    /// Build info + the update checker (`c`/`u`) — see `App::update_state`.
+    fn draw_settings(&self, frame: &mut Frame, area: Rect) {
+        let block = rounded_block(" Settings ");
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+
+        let mut lines = vec![
+            Line::from(Span::styled("maraetai", theme::accent())),
+            Line::from(format!("Built from commit {} ({})", update_check::BUILT_FROM_HASH, update_check::BUILT_FROM_DATE)),
+            Line::default(),
+        ];
+
+        match &self.update_state {
+            UpdateState::Idle => lines.push(Line::from("Press [c] to check for updates.")),
+            UpdateState::Checking => lines.push(Line::styled("Checking GitHub for updates…", theme::muted())),
+            UpdateState::UpToDate => {
+                lines.push(Line::styled("You're up to date.", theme::lossless()));
+                lines.push(Line::from("Press [c] to check again."));
+            }
+            UpdateState::Available(commit) => {
+                lines.push(Line::styled("An update is available:", theme::state_tag()));
+                lines.push(Line::from(format!("  {} — {} ({})", short_sha(&commit.sha), commit.summary, commit.date)));
+                lines.push(Line::default());
+                lines.push(Line::from("Press [u] to install it (reinstalls both binaries from GitHub)."));
+            }
+            UpdateState::ConfirmApply(commit) => {
+                lines.push(Line::styled("Really install this update?", theme::state_tag()));
+                lines.push(Line::from(format!("  {} — {}", short_sha(&commit.sha), commit.summary)));
+                lines.push(Line::default());
+                lines.push(Line::from("This runs `cargo install` for both binaries from GitHub — takes a"));
+                lines.push(Line::from("moment, and you'll need to restart the daemon and the TUI afterward."));
+                lines.push(Line::default());
+                lines.push(Line::from("Press [u] again to confirm, [Esc] to cancel."));
+            }
+            UpdateState::Applying => lines.push(Line::styled("Installing… this can take a minute.", theme::muted())),
+            UpdateState::Applied => {
+                lines.push(Line::styled("Updated.", theme::lossless()));
+                lines.push(Line::from("Quit and relaunch maraetai, and restart the daemon (Q, then"));
+                lines.push(Line::from("relaunch), to actually use it."));
+            }
+            UpdateState::Failed(err) => {
+                lines.push(Line::styled(format!("Update failed: {err}"), theme::state_tag()));
+                lines.push(Line::from("Press [c] to check again."));
+            }
+        }
+
+        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
     }
 
     /// Renders whatever's in `self.lyrics` for the current track, in the
@@ -2733,6 +2925,17 @@ mod tests {
         // Unchanged either way.
         assert_eq!(filter, "abc");
         assert_eq!(selected, 2);
+    }
+
+    #[test]
+    fn short_sha_truncates_a_full_length_sha_to_twelve_chars() {
+        assert_eq!(short_sha("abcdef1234567890fedcba"), "abcdef123456");
+    }
+
+    #[test]
+    fn short_sha_leaves_an_already_short_sha_alone() {
+        assert_eq!(short_sha("abc123"), "abc123");
+        assert_eq!(short_sha("unknown"), "unknown");
     }
 
     #[test]

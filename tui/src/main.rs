@@ -10,6 +10,7 @@ mod login;
 // `target_os = "macos"` (see `lifecycle.rs`).
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod socket_client;
+mod update_check;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
