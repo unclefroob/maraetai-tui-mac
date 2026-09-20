@@ -332,16 +332,26 @@ enum UpdateState {
     /// — a lightweight "press again to confirm" gate on an action that
     /// reinstalls both binaries, rather than a single keypress doing it.
     ConfirmApply(update_check::RemoteCommit),
-    Applying,
+    /// The rolling tail of `cargo`'s own build output (see
+    /// `update_check::apply_update`'s `on_progress`), capped at
+    /// `APPLY_LOG_LINES` — real live progress, not a static "please wait".
+    Applying(Vec<String>),
     Applied,
     Failed(String),
 }
 
-/// One check/apply's result, delivered back from the background task that
-/// ran it — see `App::update_tx`/`update_rx`, same pattern as `art_tx`/
+/// How many of `cargo`'s most recent output lines `UpdateState::Applying`
+/// keeps on screen — enough to read as a scrolling log without needing its
+/// own scrollback.
+const APPLY_LOG_LINES: usize = 10;
+
+/// One check/apply event, delivered back from the background task running
+/// it — see `App::update_tx`/`update_rx`, same pattern as `art_tx`/
 /// `lyrics_tx`.
 enum UpdateEvent {
     CheckDone(Result<update_check::CheckResult, String>),
+    /// One line of `cargo`'s build output, as it happens.
+    ApplyProgress(String),
     ApplyDone(Result<(), String>),
 }
 
@@ -937,18 +947,30 @@ impl App<'_> {
     /// land its result even if the user switched away while it ran.
     fn poll_update_events(&mut self) {
         while let Ok(event) = self.update_rx.try_recv() {
-            self.update_state = match event {
+            match event {
+                // Appends to the existing log in place, rather than
+                // replacing `update_state` wholesale like every other
+                // event below does — losing everything already streamed
+                // in would defeat the point of streaming it.
+                UpdateEvent::ApplyProgress(line) => {
+                    if let UpdateState::Applying(lines) = &mut self.update_state {
+                        lines.push(line);
+                        if lines.len() > APPLY_LOG_LINES {
+                            lines.remove(0);
+                        }
+                    }
+                }
                 UpdateEvent::CheckDone(Ok(result)) => {
-                    if result.update_available {
+                    self.update_state = if result.update_available {
                         UpdateState::Available(result.remote)
                     } else {
                         UpdateState::UpToDate
-                    }
+                    };
                 }
-                UpdateEvent::CheckDone(Err(e)) => UpdateState::Failed(e),
-                UpdateEvent::ApplyDone(Ok(())) => UpdateState::Applied,
-                UpdateEvent::ApplyDone(Err(e)) => UpdateState::Failed(e),
-            };
+                UpdateEvent::CheckDone(Err(e)) => self.update_state = UpdateState::Failed(e),
+                UpdateEvent::ApplyDone(Ok(())) => self.update_state = UpdateState::Applied,
+                UpdateEvent::ApplyDone(Err(e)) => self.update_state = UpdateState::Failed(e),
+            }
         }
     }
 
@@ -958,7 +980,7 @@ impl App<'_> {
         if !matches!(self.top(), Screen::Settings) {
             return;
         }
-        if matches!(self.update_state, UpdateState::Checking | UpdateState::Applying) {
+        if matches!(self.update_state, UpdateState::Checking | UpdateState::Applying(_)) {
             return;
         }
         self.update_state = UpdateState::Checking;
@@ -979,10 +1001,15 @@ impl App<'_> {
                 self.update_state = UpdateState::ConfirmApply(commit.clone());
             }
             UpdateState::ConfirmApply(_) => {
-                self.update_state = UpdateState::Applying;
+                self.update_state = UpdateState::Applying(Vec::new());
                 let tx = self.update_tx.clone();
                 tokio::spawn(async move {
-                    let result = update_check::apply_update().await.map_err(|e| e.to_string());
+                    let progress_tx = tx.clone();
+                    let result = update_check::apply_update(move |line| {
+                        let _ = progress_tx.send(UpdateEvent::ApplyProgress(line));
+                    })
+                    .await
+                    .map_err(|e| e.to_string());
                     let _ = tx.send(UpdateEvent::ApplyDone(result));
                 });
             }
@@ -2508,7 +2535,13 @@ impl App<'_> {
                 lines.push(Line::default());
                 lines.push(Line::from("Press [u] again to confirm, [Esc] to cancel."));
             }
-            UpdateState::Applying => lines.push(Line::styled("Installing… this can take a minute.", theme::muted())),
+            UpdateState::Applying(log_lines) => {
+                lines.push(Line::styled("Installing… this can take a minute.", theme::muted()));
+                lines.push(Line::default());
+                for log_line in log_lines {
+                    lines.push(Line::styled(log_line.clone(), theme::muted()));
+                }
+            }
             UpdateState::Applied => {
                 lines.push(Line::styled("Updated.", theme::lossless()));
                 lines.push(Line::from("Quit and relaunch maraetai, and restart the daemon (Q, then"));

@@ -8,8 +8,11 @@
 //! was built from" (see `build.rs` for how that gets embedded at compile
 //! time).
 
+use std::process::Stdio;
+
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
+use tokio::io::{AsyncBufReadExt, BufReader};
 
 /// Where this repo lives — hardcoded, since this (the macOS fork) is a
 /// genuinely separate GitHub repository from the Linux original, not a
@@ -101,21 +104,42 @@ pub async fn check_for_update() -> Result<CheckResult> {
 /// once installed. `--force` makes this idempotent rather than relying on
 /// cargo's own "is this already installed" heuristic, which isn't
 /// guaranteed to notice a new commit at the same crate version.
-pub async fn apply_update() -> Result<()> {
+///
+/// `on_progress` is called with each line of `cargo`'s own build output
+/// (compiling/downloading/etc. — cargo writes all of this to stderr, not
+/// stdout) as it's produced, not just once at the end — so the caller can
+/// show real, live progress instead of a static "please wait". Streamed
+/// rather than collected via `Command::output()` (which only hands back
+/// everything at once, after the process has already exited).
+pub async fn apply_update(mut on_progress: impl FnMut(String) + Send + 'static) -> Result<()> {
     let repo_url = format!("https://github.com/{REPO_OWNER}/{REPO_NAME}.git");
     for package in ["maraetai-daemon", "maraetai-tui"] {
-        let output = tokio::process::Command::new("cargo")
+        on_progress(format!("── installing {package} ──"));
+        let mut child = tokio::process::Command::new("cargo")
             .args(["install", "--git", &repo_url, package, "--locked", "--force"])
-            .output()
-            .await
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
             .with_context(|| format!("running cargo install for {package}"))?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            // Only the last few lines — a failed compile can produce a very
-            // long stderr, most of which isn't useful in a status message.
-            let tail: Vec<&str> = stderr.lines().rev().take(6).collect();
-            let tail: String = tail.into_iter().rev().collect::<Vec<_>>().join("\n");
-            bail!("{package} failed to install:\n{tail}");
+
+        let stderr = child.stderr.take().expect("stderr was piped above");
+        let mut lines = BufReader::new(stderr).lines();
+        // Kept alongside the live callback so a failure can still report
+        // "here's what went wrong" even though the individual lines were
+        // already streamed out (and, in the TUI, likely scrolled off the
+        // small on-screen log by the time the process actually exits).
+        let mut tail: Vec<String> = Vec::new();
+        while let Ok(Some(line)) = lines.next_line().await {
+            on_progress(line.clone());
+            tail.push(line);
+            if tail.len() > 6 {
+                tail.remove(0);
+            }
+        }
+
+        let status = child.wait().await.with_context(|| format!("waiting for cargo install {package}"))?;
+        if !status.success() {
+            bail!("{package} failed to install:\n{}", tail.join("\n"));
         }
     }
     Ok(())
