@@ -14,10 +14,10 @@ mod lifecycle;
 mod mpris;
 mod playback;
 mod range_reader;
-// Compiled (and unit-tested) on every platform — it's plain Unix-socket
-// code, nothing macOS-specific about it — but only actually wired into
-// `main()` below under `target_os = "macos"`.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+// The socket transport is compiled only where it is used. Keeping it out of
+// Linux builds avoids carrying a second, unreachable control implementation
+// (and makes dead-code checking meaningful on each target).
+#[cfg(target_os = "macos")]
 mod socket_control;
 mod visualizer;
 
@@ -101,6 +101,7 @@ async fn main() -> Result<()> {
                 dbus::MPRIS_BUS_NAME_SUFFIX,
                 MprisPlayer {
                     playback: playback.clone(),
+                    shutdown: Arc::clone(&shutdown),
                 },
             )
             .await
@@ -129,20 +130,33 @@ async fn main() -> Result<()> {
     }
 
     #[cfg(target_os = "macos")]
-    {
+    let (socket_path, mut socket_server) = {
         let socket_path = maraetai_common::paths::control_socket_path();
-        tokio::spawn(socket_control::serve(socket_path.clone(), playback.clone(), Arc::clone(&shutdown)));
+        let listener = socket_control::bind(&socket_path)
+            .with_context(|| format!("failed to bind control socket {}", socket_path.display()))?;
+        let socket_server = tokio::spawn(socket_control::serve(listener, playback.clone(), Arc::clone(&shutdown)));
 
-        // No MPRIS bridge on macOS (see the module doc) — the playback
-        // engine's events still need draining so the unbounded channel
-        // doesn't grow forever with nothing ever calling `recv()`.
+        // No MPRIS bridge on macOS (see the module doc), but playback events
+        // still need draining. Keep errors visible and consume the payloads
+        // that would otherwise be meaningful only to the Linux MPRIS bridge.
         tokio::spawn(async move {
             let mut events = event_rx;
-            while events.recv().await.is_some() {}
+            while let Some(event) = events.recv().await {
+                match event {
+                    Event::PlaybackError(message) => tracing::warn!("playback error: {message}"),
+                    Event::StatusChanged(status) => tracing::debug!(?status, "playback status changed"),
+                    Event::Seeked(position) => tracing::debug!(?position, "playback seeked"),
+                    Event::RepeatChanged(repeat) => tracing::debug!(?repeat, "repeat mode changed"),
+                    Event::ShuffleChanged(shuffle) => tracing::debug!(shuffle, "shuffle changed"),
+                    Event::TrackChanged => tracing::debug!("track changed"),
+                    Event::QueueEnded => tracing::debug!("queue ended"),
+                }
+            }
         });
 
         tracing::info!(control_socket = %socket_path.display(), idle_timeout = ?idle_timeout, "maraetaid ready");
-    }
+        (socket_path, socket_server)
+    };
 
     tokio::spawn(lifecycle::run_idle_timer(
         playback.clone(),
@@ -150,13 +164,43 @@ async fn main() -> Result<()> {
         idle_timeout,
     ));
 
+    #[cfg(target_os = "linux")]
     tokio::select! {
         _ = shutdown.notified() => tracing::info!("shutdown requested"),
         _ = tokio::signal::ctrl_c() => tracing::info!("received Ctrl-C"),
         _ = wait_for_sigterm() => tracing::info!("received SIGTERM"),
     }
 
+    #[cfg(target_os = "macos")]
+    let socket_result: Result<()> = tokio::select! {
+        _ = shutdown.notified() => {
+            tracing::info!("shutdown requested");
+            Ok(())
+        }
+        _ = tokio::signal::ctrl_c() => {
+            tracing::info!("received Ctrl-C");
+            Ok(())
+        }
+        _ = wait_for_sigterm() => {
+            tracing::info!("received SIGTERM");
+            Ok(())
+        }
+        result = &mut socket_server => {
+            match result {
+                Err(e) => Err(anyhow::anyhow!("control socket task panicked: {e}")),
+                Ok(Err(e)) => Err(e).context("control socket server failed"),
+                Ok(Ok(())) => Err(anyhow::anyhow!("control socket server exited unexpectedly")),
+            }
+        }
+    };
+
     playback.shutdown();
+    #[cfg(target_os = "macos")]
+    {
+        socket_server.abort();
+        let _ = std::fs::remove_file(&socket_path);
+        socket_result?;
+    }
     Ok(())
 }
 
@@ -201,6 +245,21 @@ async fn bridge_playback_events_to_mpris(
                     .await
                 {
                     tracing::warn!("failed to emit Seeked signal: {e}");
+                }
+            }
+            Event::RepeatChanged(repeat) => {
+                let status = match repeat {
+                    playback::RepeatMode::Off => mpris_server::LoopStatus::None,
+                    playback::RepeatMode::Track => mpris_server::LoopStatus::Track,
+                    playback::RepeatMode::Queue => mpris_server::LoopStatus::Playlist,
+                };
+                if let Err(e) = server.properties_changed([Property::LoopStatus(status)]).await {
+                    tracing::warn!("failed to emit LoopStatus change: {e}");
+                }
+            }
+            Event::ShuffleChanged(shuffle) => {
+                if let Err(e) = server.properties_changed([Property::Shuffle(shuffle)]).await {
+                    tracing::warn!("failed to emit Shuffle change: {e}");
                 }
             }
             Event::QueueEnded => {

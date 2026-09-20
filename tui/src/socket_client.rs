@@ -6,9 +6,8 @@
 //! `app.rs`/`lifecycle.rs` don't need to know which transport is active —
 //! see `main.rs`'s platform split.
 //!
-//! Pure Unix-socket code — nothing here is actually macOS-specific — so
-//! it's compiled and unit-tested on every platform; only `main.rs` decides
-//! which platform actually uses it.
+//! This module is target-gated to macOS because Linux uses D-Bus and should
+//! not compile an unreachable second control implementation.
 
 use std::marker::PhantomData;
 use std::sync::Arc;

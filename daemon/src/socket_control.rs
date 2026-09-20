@@ -7,12 +7,11 @@
 //! uses, so the two transports can't drift in behavior, only in wire
 //! format.
 //!
-//! Pure Unix-socket code — nothing here is actually macOS-specific (Unix
-//! domain sockets are the same POSIX API on Linux), so this module is
-//! compiled and unit-tested on every platform. Only `main.rs` decides
-//! which platform actually *runs* it.
+//! The protocol uses ordinary Unix sockets, but this module is target-gated
+//! to macOS because Linux uses D-Bus and should not compile an unreachable
+//! second control implementation.
 
-use std::path::PathBuf;
+use std::path::Path;
 use std::sync::Arc;
 
 use maraetai_common::control_protocol::{Request, Response};
@@ -22,11 +21,10 @@ use tokio::sync::Notify;
 
 use crate::playback::{PlaybackHandle, queue_row_from_track, status_tuple_from_snapshot, track_meta_from_entry};
 
-/// Binds the control socket and serves connections until `shutdown` fires.
-/// One task per connection, each served strictly request-then-response (the
-/// TUI only ever has one call in flight at a time), so no request-id
-/// correlation is needed on the wire.
-pub async fn serve(socket_path: PathBuf, playback: PlaybackHandle, shutdown: Arc<Notify>) -> std::io::Result<()> {
+/// Binds the control socket before the daemon announces that it is ready.
+/// Keeping this synchronous with startup means path/permission/bind errors
+/// are returned to `main` instead of disappearing inside a detached task.
+pub fn bind(socket_path: &Path) -> std::io::Result<UnixListener> {
     // A stale socket file from a crashed previous run must not block
     // binding a fresh one — the daemon's single-instance pidfile lock
     // (`lifecycle::acquire_single_instance_lock`) already guarantees only
@@ -36,15 +34,18 @@ pub async fn serve(socket_path: PathBuf, playback: PlaybackHandle, shutdown: Arc
     if let Some(dir) = socket_path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    let listener = UnixListener::bind(&socket_path)?;
+    UnixListener::bind(socket_path)
+}
+
+/// Serves one strictly request-then-response stream per connection (the TUI
+/// only ever has one call in flight at a time), so no request-id correlation
+/// is needed on the wire. `main` is the sole waiter on `shutdown`; it aborts
+/// this task while exiting, preventing a `notify_one` race between two
+/// independent shutdown waiters.
+pub async fn serve(listener: UnixListener, playback: PlaybackHandle, shutdown: Arc<Notify>) -> std::io::Result<()> {
     loop {
-        tokio::select! {
-            accepted = listener.accept() => {
-                let (stream, _) = accepted?;
-                tokio::spawn(handle_connection(stream, playback.clone(), Arc::clone(&shutdown)));
-            }
-            () = shutdown.notified() => return Ok(()),
-        }
+        let (stream, _) = listener.accept().await?;
+        tokio::spawn(handle_connection(stream, playback.clone(), Arc::clone(&shutdown)));
     }
 }
 
@@ -57,15 +58,25 @@ async fn handle_connection(stream: UnixStream, playback: PlaybackHandle, shutdow
             Ok(None) => return, // client disconnected
             Err(_) => return,
         };
-        let response = match serde_json::from_str::<Request>(&line) {
-            Ok(request) => dispatch(request, &playback, &shutdown),
-            Err(e) => Response::Error(format!("bad request: {e}")),
+        let (response, should_shutdown) = match serde_json::from_str::<Request>(&line) {
+            Ok(request) => {
+                let should_shutdown = matches!(request, Request::Quit);
+                (dispatch(request, &playback), should_shutdown)
+            }
+            Err(e) => (Response::Error(format!("bad request: {e}")), false),
         };
         let Ok(mut encoded) = serde_json::to_string(&response) else {
             continue; // never actually fails for these types, but not worth a panic if it somehow did
         };
         encoded.push('\n');
         if writer.write_all(encoded.as_bytes()).await.is_err() {
+            return;
+        }
+        if should_shutdown {
+            // Reply before waking `main`, otherwise process teardown can
+            // close the socket while the client is still awaiting the Quit
+            // response and report a false failure for a successful stop.
+            shutdown.notify_one();
             return;
         }
     }
@@ -75,7 +86,7 @@ async fn handle_connection(stream: UnixStream, playback: PlaybackHandle, shutdow
 /// `ControlInterface` method in `control.rs` exactly (same `PlaybackHandle`
 /// calls, same conversions), just addressed by an enum tag instead of a
 /// D-Bus method name.
-fn dispatch(request: Request, playback: &PlaybackHandle, shutdown: &Arc<Notify>) -> Response {
+fn dispatch(request: Request, playback: &PlaybackHandle) -> Response {
     match request {
         Request::PlayQueue { tracks, start_index } => {
             playback.play_queue(tracks.into_iter().map(track_meta_from_entry).collect(), start_index as usize);
@@ -155,10 +166,7 @@ fn dispatch(request: Request, playback: &PlaybackHandle, shutdown: &Arc<Notify>)
             playback.mark_client_activity();
             Response::Status(status_tuple_from_snapshot(&playback.snapshot()))
         }
-        Request::Quit => {
-            shutdown.notify_one();
-            Response::Unit
-        }
+        Request::Quit => Response::Unit,
     }
 }
 

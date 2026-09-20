@@ -287,7 +287,11 @@ pub enum Command {
     Seek(Duration),
     SetVolume(f32),
     CycleRepeat,
+    #[cfg(target_os = "linux")]
+    SetRepeat(RepeatMode),
     ToggleShuffle,
+    #[cfg(target_os = "linux")]
+    SetShuffle(bool),
     Shutdown,
 }
 
@@ -306,6 +310,8 @@ pub enum Event {
     /// surfacing to the user (e.g. as a TUI toast), not full error internals.
     PlaybackError(String),
     Seeked(Duration),
+    RepeatChanged(RepeatMode),
+    ShuffleChanged(bool),
 }
 
 /// The handle every other part of the daemon (MPRIS interface, custom
@@ -406,8 +412,16 @@ impl PlaybackHandle {
     pub fn cycle_repeat(&self) {
         self.send(Command::CycleRepeat);
     }
+    #[cfg(target_os = "linux")]
+    pub fn set_repeat(&self, repeat: RepeatMode) {
+        self.send(Command::SetRepeat(repeat));
+    }
     pub fn toggle_shuffle(&self) {
         self.send(Command::ToggleShuffle);
+    }
+    #[cfg(target_os = "linux")]
+    pub fn set_shuffle(&self, shuffle: bool) {
+        self.send(Command::SetShuffle(shuffle));
     }
     pub fn shutdown(&self) {
         self.send(Command::Shutdown);
@@ -604,9 +618,14 @@ fn run_engine(
             Ok(Command::PlayQueue { tracks, start_index }) => {
                 state.queue = tracks;
                 snapshot.lock().expect("poisoned").queue = state.queue.clone();
-                regenerate_play_order(&mut state, None);
                 let start_index = start_index.min(state.queue.len().saturating_sub(1));
-                start_playback_at(&mut state, &snapshot, &events, start_index);
+                state.play_order = new_queue_play_order(state.queue.len(), state.shuffle, start_index);
+                state.order_pos = 0;
+                if state.queue.is_empty() {
+                    stop_and_clear_current(&mut state, &snapshot, &events);
+                } else {
+                    start_playback_at(&mut state, &snapshot, &events, start_index);
+                }
             }
             Ok(Command::AppendQueue(tracks)) => {
                 if !tracks.is_empty() {
@@ -776,9 +795,14 @@ fn run_engine(
                 }
             }
             Ok(Command::Resume) => {
-                if let Some(sink) = &state.sink {
-                    sink.play();
-                    set_status(&snapshot, &events, Status::Playing);
+                if state.current.is_some() {
+                    if let Some(sink) = &state.sink {
+                        sink.play();
+                        set_status(&snapshot, &events, Status::Playing);
+                    }
+                } else if !state.queue.is_empty() {
+                    let index = state.index.min(state.queue.len() - 1);
+                    start_playback_at(&mut state, &snapshot, &events, index);
                 }
             }
             Ok(Command::Stop) => {
@@ -818,6 +842,13 @@ fn run_engine(
             Ok(Command::CycleRepeat) => {
                 state.repeat = state.repeat.cycle();
                 snapshot.lock().expect("poisoned").repeat = state.repeat;
+                let _ = events.send(Event::RepeatChanged(state.repeat));
+            }
+            #[cfg(target_os = "linux")]
+            Ok(Command::SetRepeat(repeat)) => {
+                state.repeat = repeat;
+                snapshot.lock().expect("poisoned").repeat = repeat;
+                let _ = events.send(Event::RepeatChanged(repeat));
             }
             Ok(Command::ToggleShuffle) => {
                 state.shuffle = !state.shuffle;
@@ -827,6 +858,17 @@ fn run_engine(
                 let current = state.index;
                 regenerate_play_order(&mut state, Some(current));
                 snapshot.lock().expect("poisoned").shuffle = state.shuffle;
+                let _ = events.send(Event::ShuffleChanged(state.shuffle));
+            }
+            #[cfg(target_os = "linux")]
+            Ok(Command::SetShuffle(shuffle)) => {
+                if state.shuffle != shuffle {
+                    state.shuffle = shuffle;
+                    let current = state.index;
+                    regenerate_play_order(&mut state, Some(current));
+                }
+                snapshot.lock().expect("poisoned").shuffle = state.shuffle;
+                let _ = events.send(Event::ShuffleChanged(state.shuffle));
             }
             Ok(Command::Shutdown) => {
                 if let Some(sink) = state.sink.take() {
@@ -875,6 +917,17 @@ fn shuffled_play_order(len: usize, shuffle: bool, anchor: Option<usize>) -> Vec<
         let mut order: Vec<usize> = (0..len).collect();
         order.shuffle(&mut rand::thread_rng());
         order
+    }
+}
+
+/// Builds the traversal order for a newly replaced queue. The explicitly
+/// selected starting track must be first even when shuffle is enabled;
+/// otherwise entries shuffled before it would never be visited.
+fn new_queue_play_order(len: usize, shuffle: bool, start_index: usize) -> Vec<usize> {
+    if len == 0 {
+        Vec::new()
+    } else {
+        shuffled_play_order(len, shuffle, Some(start_index.min(len - 1)))
     }
 }
 
@@ -993,6 +1046,38 @@ impl<S: Source<Item = f32>> Source for VolumeControl<S> {
     }
 }
 
+/// Stops the current source and resets every now-playing field. Used when a
+/// queue replacement is empty; unlike `Stop`, this also removes the current
+/// track because there is no queue entry left for the UI to display.
+fn stop_and_clear_current(
+    state: &mut EngineState,
+    snapshot: &Arc<Mutex<Snapshot>>,
+    events: &UnboundedSender<Event>,
+) {
+    maybe_scrobble_outgoing(state, current_position(state));
+    if let Some(sink) = state.sink.take() {
+        sink.stop();
+    }
+    state.current = None;
+    state.current_format = None;
+    state.index = 0;
+    state.order_pos = 0;
+    state.analyzer.reset();
+    {
+        let mut snap = snapshot.lock().expect("poisoned");
+        snap.status = Status::Stopped;
+        snap.position = Duration::ZERO;
+        snap.track = None;
+        snap.queue_index = 0;
+        snap.queue_len = state.queue.len();
+        snap.queue = state.queue.clone();
+        snap.spectrum = [0; visualizer::BARS];
+    }
+    let _ = events.send(Event::TrackChanged);
+    let _ = events.send(Event::QueueEnded);
+    let _ = events.send(Event::StatusChanged(Status::Stopped));
+}
+
 /// Starts playing `state.queue[index]`, replacing whatever was playing.
 fn start_playback_at(
     state: &mut EngineState,
@@ -1043,8 +1128,20 @@ fn start_playback_at(
         Err(e) => {
             tracing::error!("failed to decode stream: {e}");
             let _ = events.send(Event::PlaybackError(format!("could not play track: {e}")));
-            set_status(snapshot, events, Status::Stopped);
             state.current = None;
+            state.current_format = None;
+            state.analyzer.reset();
+            {
+                let mut snap = snapshot.lock().expect("poisoned");
+                snap.status = Status::Stopped;
+                snap.position = Duration::ZERO;
+                snap.track = None;
+                snap.queue_index = index;
+                snap.queue_len = state.queue.len();
+                snap.spectrum = [0; visualizer::BARS];
+            }
+            let _ = events.send(Event::TrackChanged);
+            let _ = events.send(Event::StatusChanged(Status::Stopped));
             return;
         }
     };
@@ -1294,6 +1391,18 @@ mod tests {
             sorted.sort_unstable();
             assert_eq!(sorted, vec![0, 1, 2, 3, 4, 5], "must still be a full permutation: {order:?}");
         }
+    }
+
+    #[test]
+    fn a_new_shuffled_queue_starts_at_the_requested_track_without_skipping_entries() {
+        for _ in 0..20 {
+            let order = new_queue_play_order(6, true, 4);
+            assert_eq!(order[0], 4);
+            let mut sorted = order;
+            sorted.sort_unstable();
+            assert_eq!(sorted, vec![0, 1, 2, 3, 4, 5]);
+        }
+        assert!(new_queue_play_order(0, true, 0).is_empty());
     }
 
     #[test]

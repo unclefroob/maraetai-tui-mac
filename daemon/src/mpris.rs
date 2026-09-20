@@ -4,15 +4,19 @@
 //! spec has a lot of required properties/methods, and this crate is a
 //! purpose-built, already-correct implementation of that surface.
 
+use std::sync::Arc;
+
 use mpris_server::{
     LoopStatus, Metadata, PlaybackRate, PlaybackStatus, PlayerInterface, RootInterface, Time,
     TrackId, Volume, zbus::fdo,
 };
+use tokio::sync::Notify;
 
-use crate::playback::{PlaybackHandle, Status};
+use crate::playback::{PlaybackHandle, RepeatMode, Status};
 
 pub struct MprisPlayer {
     pub playback: PlaybackHandle,
+    pub shutdown: Arc<Notify>,
 }
 
 impl RootInterface for MprisPlayer {
@@ -24,7 +28,7 @@ impl RootInterface for MprisPlayer {
     }
 
     async fn quit(&self) -> fdo::Result<()> {
-        self.playback.shutdown();
+        self.shutdown.notify_one();
         Ok(())
     }
 
@@ -141,12 +145,20 @@ impl PlayerInterface for MprisPlayer {
     }
 
     async fn loop_status(&self) -> fdo::Result<LoopStatus> {
-        // Repeat/shuffle are queue concepts owned by the TUI/control layer
-        // in v1 — the daemon itself only ever plays one track at a time.
-        Ok(LoopStatus::None)
+        Ok(match self.playback.snapshot().repeat {
+            RepeatMode::Off => LoopStatus::None,
+            RepeatMode::Track => LoopStatus::Track,
+            RepeatMode::Queue => LoopStatus::Playlist,
+        })
     }
 
-    async fn set_loop_status(&self, _loop_status: LoopStatus) -> mpris_server::zbus::Result<()> {
+    async fn set_loop_status(&self, loop_status: LoopStatus) -> mpris_server::zbus::Result<()> {
+        let repeat = match loop_status {
+            LoopStatus::None => RepeatMode::Off,
+            LoopStatus::Track => RepeatMode::Track,
+            LoopStatus::Playlist => RepeatMode::Queue,
+        };
+        self.playback.set_repeat(repeat);
         Ok(())
     }
 
@@ -159,10 +171,11 @@ impl PlayerInterface for MprisPlayer {
     }
 
     async fn shuffle(&self) -> fdo::Result<bool> {
-        Ok(false)
+        Ok(self.playback.snapshot().shuffle)
     }
 
-    async fn set_shuffle(&self, _shuffle: bool) -> mpris_server::zbus::Result<()> {
+    async fn set_shuffle(&self, shuffle: bool) -> mpris_server::zbus::Result<()> {
+        self.playback.set_shuffle(shuffle);
         Ok(())
     }
 

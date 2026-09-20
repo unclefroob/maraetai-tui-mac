@@ -5,10 +5,9 @@ mod dbus_client;
 mod library;
 mod lifecycle;
 mod login;
-// Compiled (and unit-tested) on every platform — it's plain Unix-socket
-// code, nothing macOS-specific about it — but only actually used under
-// `target_os = "macos"` (see `lifecycle.rs`).
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+// The socket client is compiled only where it is used; Linux has the D-Bus
+// client instead (see `lifecycle.rs`).
+#[cfg(target_os = "macos")]
 mod socket_client;
 mod update_check;
 

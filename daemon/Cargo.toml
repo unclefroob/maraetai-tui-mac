@@ -13,9 +13,7 @@ maraetai-common.workspace = true
 tokio.workspace = true
 reqwest = { workspace = true, features = ["blocking"] }
 clap.workspace = true
-serde.workspace = true
 serde_json.workspace = true
-thiserror.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
@@ -27,7 +25,7 @@ tracing-subscriber.workspace = true
 # brings a breaking change to f32 samples (was i16), reflected in
 # visualizer.rs.
 rodio = { version = "=0.21.1", default-features = false, features = ["symphonia-all", "playback"] }
-nix = { version = "0.29", features = ["process", "signal", "fs"] }
+nix = { version = "0.29", features = ["fs"] }
 rustfft = "6"
 rand.workspace = true
 
