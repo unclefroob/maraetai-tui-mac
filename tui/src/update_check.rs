@@ -8,9 +8,10 @@
 //! was built from" (see `build.rs` for how that gets embedded at compile
 //! time).
 
+use std::path::PathBuf;
 use std::process::Stdio;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
 use tokio::io::{AsyncBufReadExt, BufReader};
 
@@ -113,14 +114,15 @@ pub async fn check_for_update() -> Result<CheckResult> {
 /// everything at once, after the process has already exited).
 pub async fn apply_update(mut on_progress: impl FnMut(String) + Send + 'static) -> Result<()> {
     let repo_url = format!("https://github.com/{REPO_OWNER}/{REPO_NAME}.git");
+    let cargo = cargo_binary_path();
     for package in ["maraetai-daemon", "maraetai-tui"] {
         on_progress(format!("── installing {package} ──"));
-        let mut child = tokio::process::Command::new("cargo")
+        let mut child = tokio::process::Command::new(&cargo)
             .args(["install", "--git", &repo_url, package, "--locked", "--force"])
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()
-            .with_context(|| format!("running cargo install for {package}"))?;
+            .map_err(|e| anyhow!("could not start {} for {package}: {e}", cargo.display()))?;
 
         let stderr = child.stderr.take().expect("stderr was piped above");
         let mut lines = BufReader::new(stderr).lines();
@@ -143,6 +145,24 @@ pub async fn apply_update(mut on_progress: impl FnMut(String) + Send + 'static) 
         }
     }
     Ok(())
+}
+
+/// Finds Cargo without assuming the process inherited an interactive
+/// shell's PATH. A rustup installation normally puts `cargo`, `maraetai`,
+/// and `maraetaid` beside one another in `~/.cargo/bin`, so the sibling
+/// lookup covers a TUI launched from a shell, Finder, or another process
+/// with a restricted environment. `CARGO` remains an explicit override.
+fn cargo_binary_path() -> PathBuf {
+    if let Some(path) = std::env::var_os("CARGO").filter(|path| !path.is_empty()) {
+        return PathBuf::from(path);
+    }
+    if let Ok(mut exe) = std::env::current_exe() {
+        exe.set_file_name("cargo");
+        if exe.is_file() {
+            return exe;
+        }
+    }
+    PathBuf::from("cargo")
 }
 
 #[cfg(test)]
