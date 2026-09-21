@@ -87,6 +87,25 @@ Keychain, looked up by username at connect time.
 
 ## Setup
 
+### Precompiled release (recommended)
+
+Download the archive for your Mac from the
+[GitHub Releases page](https://github.com/unclefroob/maraetai-tui-mac/releases):
+
+```sh
+# Apple Silicon (M1/M2/M3/M4)
+curl -LO https://github.com/unclefroob/maraetai-tui-mac/releases/latest/download/maraetai-tui-macos-arm64.tar.gz
+tar -xzf maraetai-tui-macos-arm64.tar.gz
+install -m 755 maraetai-tui-macos-arm64/maraetai ~/.local/bin/
+install -m 755 maraetai-tui-macos-arm64/maraetaid ~/.local/bin/
+```
+
+Use `maraetai-tui-macos-x64.tar.gz` instead on an Intel Mac. Ensure
+`~/.local/bin` is on your `PATH`, then run `maraetai login` followed by
+`maraetai`.
+
+### From source
+
 ```sh
 xcode-select --install        # once, if you don't already have it — needed
                                # to build native deps (Keychain bindings, TLS)
