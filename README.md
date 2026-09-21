@@ -100,9 +100,8 @@ install -m 755 maraetai-tui-macos-arm64/maraetai ~/.local/bin/
 install -m 755 maraetai-tui-macos-arm64/maraetaid ~/.local/bin/
 ```
 
-Use `maraetai-tui-macos-x64.tar.gz` instead on an Intel Mac. Ensure
-`~/.local/bin` is on your `PATH`, then run `maraetai login` followed by
-`maraetai`.
+This release currently supports Apple Silicon only. Ensure `~/.local/bin` is
+on your `PATH`, then run `maraetai login` followed by `maraetai`.
 
 ### From source
 
